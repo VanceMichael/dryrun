@@ -64,9 +64,10 @@ func getBoolArg(req mcp.CallToolRequest, key string) bool {
 	return b
 }
 
-// Lookup tools answer about one object and need a schema to resolve against.
+// Lookup tools resolve a missing schema against the snapshot's captured
+// search_path, never a hard-coded default; callers take the raw argument.
 func schemaArg(req mcp.CallToolRequest) string {
-	return argOr(req, "schema", "public")
+	return getArg(req, "schema")
 }
 
 // Filter tools must not default: absent means every schema, not "public".

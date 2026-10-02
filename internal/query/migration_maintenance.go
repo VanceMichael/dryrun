@@ -61,7 +61,7 @@ func rewriteMaintenance(operation, reason string, rels []*pg_query.RangeVar, a *
 	rec := reason
 	note := ""
 	if len(rels) == 1 {
-		qual := schema.QualifiedName{Schema: schemaOf(rels[0]), Name: rels[0].GetRelname()}
+		qual := schema.QualifiedName{Schema: schemaOf(a.Schema, rels[0]), Name: rels[0].GetRelname()}
 		size, rows, small, sizing := lookupTableStats(a, qual)
 		check.Table = strp(relationName(rels[0]))
 		check.TableSize, check.RowEstimate = size, rows

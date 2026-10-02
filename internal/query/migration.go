@@ -83,7 +83,7 @@ func CheckMigration(ddl string, a *schema.AnnotatedSchema) ([]MigrationCheck, er
 
 	var checks []MigrationCheck
 	names := newNameAllocator(a.Schema)
-	cat := newFileCatalog()
+	cat := newFileCatalog(a.Schema)
 
 	// checks[from:] are the previous statement's, which ran with stmtTx
 	inTx, stmtTx, from, txFrom := false, false, 0, 0
@@ -208,7 +208,7 @@ func CheckMigration(ddl string, a *schema.AnnotatedSchema) ([]MigrationCheck, er
 		case *pg_query.Node_DropStmt:
 			switch n.DropStmt.RemoveType {
 			case pg_query.ObjectType_OBJECT_TABLE:
-				for _, key := range dropTableKeys(n.DropStmt) {
+				for _, key := range dropTableKeys(a.Schema, n.DropStmt) {
 					delete(cat.created, key)
 					delete(cat.empty, key)
 					delete(cat.partitioned, key)
@@ -259,6 +259,7 @@ func CheckMigration(ddl string, a *schema.AnnotatedSchema) ([]MigrationCheck, er
 // sized against a pre-existing table.
 type (
 	fileCatalog struct {
+		snap        *schema.SchemaSnapshot                 // resolution context for bare names
 		created     map[string]bool                        // relKey of tables created in this file
 		empty       map[string]bool                        // relKey of tables created empty in this file
 		partitioned map[string]bool                        // relKey of partitioned parents created in this file
@@ -268,8 +269,9 @@ type (
 	}
 )
 
-func newFileCatalog() *fileCatalog {
+func newFileCatalog(snap *schema.SchemaSnapshot) *fileCatalog {
 	return &fileCatalog{
+		snap:        snap,
 		created:     map[string]bool{},
 		empty:       map[string]bool{},
 		partitioned: map[string]bool{},
@@ -283,7 +285,7 @@ func (c *fileCatalog) markCreated(rel *pg_query.RangeVar, partitioned, condition
 	if rel == nil {
 		return
 	}
-	key := relKey(rel)
+	key := relKey(c.snap, rel)
 	c.created[key] = true
 	c.empty[key] = true
 	if partitioned {
@@ -298,8 +300,8 @@ func (c *fileCatalog) invalidate(rel *pg_query.RangeVar) {
 	if rel == nil {
 		return
 	}
-	delete(c.empty, relKey(rel))
-	delete(c.conditional, relKey(rel))
+	delete(c.empty, relKey(c.snap, rel))
+	delete(c.conditional, relKey(c.snap, rel))
 }
 
 func (c *fileCatalog) invalidateAll() {
@@ -308,27 +310,27 @@ func (c *fileCatalog) invalidateAll() {
 }
 
 func (c *fileCatalog) isEmpty(rel *pg_query.RangeVar) bool {
-	return c != nil && rel != nil && c.empty[relKey(rel)]
+	return c != nil && rel != nil && c.empty[relKey(c.snap, rel)]
 }
 
 func (c *fileCatalog) isPartitioned(rel *pg_query.RangeVar) bool {
-	return c != nil && rel != nil && c.partitioned[relKey(rel)]
+	return c != nil && rel != nil && c.partitioned[relKey(c.snap, rel)]
 }
 
 func (c *fileCatalog) isConditional(rel *pg_query.RangeVar) bool {
-	return c != nil && rel != nil && c.conditional[relKey(rel)]
+	return c != nil && rel != nil && c.conditional[relKey(c.snap, rel)]
 }
 
 func (c *fileCatalog) hasCreated(rel *pg_query.RangeVar) bool {
-	return c != nil && rel != nil && c.created[relKey(rel)]
+	return c != nil && rel != nil && c.created[relKey(c.snap, rel)]
 }
 
 func (c *fileCatalog) rekey(oldRel *pg_query.RangeVar, newName string) {
 	if oldRel == nil || newName == "" {
 		return
 	}
-	schemaName := schemaOf(oldRel)
-	oldKey := relKey(oldRel)
+	schemaName := schemaOf(c.snap, oldRel)
+	oldKey := relKey(c.snap, oldRel)
 	newKey := schemaName + "." + newName
 	if c.created[oldKey] {
 		delete(c.created, oldKey)
@@ -371,8 +373,10 @@ func alterAttachesPartition(stmt *pg_query.AlterTableStmt) bool {
 	return false
 }
 
-// DROP TABLE's objects are [schema, name] string lists.
-func dropTableKeys(drop *pg_query.DropStmt) []string {
+// DROP TABLE's objects are [schema, name] string lists. A bare name is
+// keyed through the same captured search_path the create was, so the DROP
+// clears the catalog entry the CREATE made.
+func dropTableKeys(snap *schema.SchemaSnapshot, drop *pg_query.DropStmt) []string {
 	var keys []string
 	for _, obj := range drop.GetObjects() {
 		list, ok := obj.GetNode().(*pg_query.Node_List)
@@ -387,7 +391,7 @@ func dropTableKeys(drop *pg_query.DropStmt) []string {
 		}
 		switch len(parts) {
 		case 1:
-			keys = append(keys, "public."+parts[0])
+			keys = append(keys, schemaOf(snap, &pg_query.RangeVar{Relname: parts[0]})+"."+parts[0])
 		case 2:
 			keys = append(keys, parts[0]+"."+parts[1])
 		}
@@ -404,7 +408,7 @@ func analyzeAlterTableCmd(cmd *pg_query.AlterTableCmd, stmt *pg_query.AlterTable
 			tableName = stmt.Relation.Relname
 		}
 	}
-	qual := schema.QualifiedName{Schema: schemaOf(stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
+	qual := schema.QualifiedName{Schema: schemaOf(a.Schema, stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
 	tableSize, rowEstimate, small, sizing := lookupTableStats(a, qual)
 	statement := alterCmdStatement(stmt, cmd)
 
@@ -702,7 +706,7 @@ func createTableNoOp(rel *pg_query.RangeVar, a *schema.AnnotatedSchema, cat *fil
 	}
 	// Size from the snapshot only: a table this file created has no captured size.
 	if !cat.hasCreated(rel) {
-		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()})
+		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()})
 		c.TableSize = size
 		c.RowEstimate = rows
 		if size == nil {
@@ -725,7 +729,7 @@ func analyzeAnalyze(stmt *pg_query.VacuumStmt, a *schema.AnnotatedSchema, stmtNo
 	if rels := stmt.GetRels(); len(rels) > 0 {
 		if rv := rels[0].GetVacuumRelation().GetRelation(); rv != nil {
 			c.Table = strp(relationName(rv))
-			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rv), Name: rv.GetRelname()})
+			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rv), Name: rv.GetRelname()})
 			c.TableSize, c.RowEstimate = size, rows
 		}
 	}
@@ -744,7 +748,7 @@ func analyzeCreateStats(stmt *pg_query.CreateStatsStmt, a *schema.AnnotatedSchem
 	if rels := stmt.GetRelations(); len(rels) > 0 {
 		if rv := rels[0].GetRangeVar(); rv != nil {
 			c.Table = strp(relationName(rv))
-			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rv), Name: rv.GetRelname()})
+			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rv), Name: rv.GetRelname()})
 			c.TableSize, c.RowEstimate = size, rows
 		}
 	}
@@ -1896,7 +1900,7 @@ func analyzeCreateIndex(idx *pg_query.IndexStmt, a *schema.AnnotatedSchema, name
 			tableName = idx.Relation.Relname
 		}
 	}
-	qual := schema.QualifiedName{Schema: schemaOf(idx.GetRelation()), Name: idx.GetRelation().GetRelname()}
+	qual := schema.QualifiedName{Schema: schemaOf(a.Schema, idx.GetRelation()), Name: idx.GetRelation().GetRelname()}
 	tableSize, rowEstimate, small, sizing := lookupTableStats(a, qual)
 	// index method and columns for jit
 	idxMethod := "btree"
@@ -2250,7 +2254,7 @@ func dropIndexCheck(drop *pg_query.DropStmt, stmtNode *pg_query.Node) MigrationC
 // no-WHERE write on a table that is not known small is a caution.
 func analyzeDML(operation string, rel *pg_query.RangeVar, bounded bool, a *schema.AnnotatedSchema, cat *fileCatalog, stmtNode *pg_query.Node) MigrationCheck {
 	tableName := relationName(rel)
-	qual := schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()}
+	qual := schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()}
 	tableSize, rowEstimate, small, sizing := lookupTableStats(a, qual)
 	statement := topLevelStatement(stmtNode)
 
@@ -2317,7 +2321,7 @@ func analyzeComment(stmt *pg_query.CommentStmt, a *schema.AnnotatedSchema, stmtN
 	}
 	if rel := commentRelation(stmt); rel != nil {
 		c.Table = strp(relationName(rel))
-		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()})
+		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()})
 		c.TableSize = size
 		c.RowEstimate = rows
 	}
@@ -2375,7 +2379,7 @@ func dropTriggerCheck(drop *pg_query.DropStmt, a *schema.AnnotatedSchema, stmtNo
 	}
 	if rel := dropTriggerRelation(drop); rel != nil {
 		c.Table = strp(relationName(rel))
-		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()})
+		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()})
 		c.TableSize = size
 		c.RowEstimate = rows
 	}
@@ -2491,7 +2495,7 @@ func analyzeReindex(stmt *pg_query.ReindexStmt, a *schema.AnnotatedSchema, cat *
 	if stmt.GetKind() == pg_query.ReindexObjectType_REINDEX_OBJECT_INDEX ||
 		stmt.GetKind() == pg_query.ReindexObjectType_REINDEX_OBJECT_TABLE {
 		hasSchema := stmt.GetRelation().GetSchemaname() != ""
-		qual := schema.QualifiedName{Schema: schemaOf(stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
+		qual := schema.QualifiedName{Schema: schemaOf(a.Schema, stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
 		if stmt.GetKind() == pg_query.ReindexObjectType_REINDEX_OBJECT_INDEX {
 			qual = tableOfIndex(a, qual, hasSchema)
 		} else {
@@ -2521,16 +2525,36 @@ func analyzeReindex(stmt *pg_query.ReindexStmt, a *schema.AnnotatedSchema, cat *
 	return base
 }
 
-// tableOfIndex resolves REINDEX INDEX's parent table so it can be sized. Unless
-// the statement qualified the schema, match the index name across schemas.
+// tableOfIndex resolves REINDEX INDEX's parent table so it can be sized. A
+// qualified schema is matched exactly; a bare index name resolves along the
+// captured search_path, so a same-named index in another schema can never be
+// sized in its place.
 func tableOfIndex(a *schema.AnnotatedSchema, idx schema.QualifiedName, hasSchema bool) schema.QualifiedName {
 	if a == nil || a.Schema == nil {
 		return idx
 	}
-	for _, t := range a.Schema.Tables {
-		for _, i := range t.Indexes {
-			if i.Name == idx.Name && (!hasSchema || idx.Schema == t.Schema) {
-				return schema.QualifiedName{Schema: t.Schema, Name: t.Name}
+	if hasSchema {
+		for _, t := range a.Schema.Tables {
+			if t.Schema != idx.Schema {
+				continue
+			}
+			for _, i := range t.Indexes {
+				if i.Name == idx.Name {
+					return schema.QualifiedName{Schema: t.Schema, Name: t.Name}
+				}
+			}
+		}
+		return idx
+	}
+	for _, sch := range schema.EffectiveSearchPath(a.Schema) {
+		for _, t := range a.Schema.Tables {
+			if t.Schema != sch {
+				continue
+			}
+			for _, i := range t.Indexes {
+				if i.Name == idx.Name {
+					return schema.QualifiedName{Schema: t.Schema, Name: t.Name}
+				}
 			}
 		}
 	}

@@ -46,7 +46,7 @@ func (a *nameAllocator) claim(bucket, base string) string {
 
 // Constraint names are unique per table; the bucket is seeded from the snapshot.
 func (a *nameAllocator) constraintBucket(rel *pg_query.RangeVar) string {
-	bucket := "constraint:" + relKey(rel)
+	bucket := "constraint:" + relKey(a.snap, rel)
 	if _, ok := a.taken[bucket]; ok {
 		return bucket
 	}
@@ -62,7 +62,7 @@ func (a *nameAllocator) constraintBucket(rel *pg_query.RangeVar) string {
 
 // Index names are unique per schema, not per table.
 func (a *nameAllocator) indexBucket(rel *pg_query.RangeVar) string {
-	sch := schemaOf(rel)
+	sch := schemaOf(a.snap, rel)
 	bucket := "index:" + sch
 	if _, ok := a.taken[bucket]; ok {
 		return bucket
@@ -438,28 +438,32 @@ func relationName(rel *pg_query.RangeVar) string {
 	return quoteIdent(rel.GetSchemaname()) + "." + quoteIdent(rel.GetRelname())
 }
 
-func schemaOf(rel *pg_query.RangeVar) string {
-	if s := rel.GetSchemaname(); s != "" {
-		return s
+// schemaOf names the schema a parsed RangeVar denotes under the snapshot's
+// captured search_path: an explicit qualifier always wins; a bare name
+// resolves to the first path schema holding the relation, or to the path's
+// creation target (legacy "public" on old bundles) for a table the snapshot
+// does not hold yet. Every sizing, naming and constraint lookup shares it,
+// so one statement can never read another schema's same-named object.
+func schemaOf(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar) string {
+	if rel == nil {
+		return schema.LegacyDefaultSchema
 	}
-	return "public"
+	return schema.NewResolver(snap).ResolveSchemaName(rel.GetSchemaname(), rel.GetRelname())
 }
 
-func relKey(rel *pg_query.RangeVar) string {
-	return schemaOf(rel) + "." + rel.GetRelname()
+func relKey(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar) string {
+	return schemaOf(snap, rel) + "." + rel.GetRelname()
 }
 
 func lookupTable(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar) *schema.Table {
-	if snap == nil {
+	if snap == nil || rel == nil {
 		return nil
 	}
-	key := relKey(rel)
-	for i := range snap.Tables {
-		if snap.Tables[i].Schema+"."+snap.Tables[i].Name == key {
-			return &snap.Tables[i]
-		}
+	t, _, ok := schema.NewResolver(snap).ResolveTable(rel.GetSchemaname(), rel.GetRelname())
+	if !ok {
+		return nil
 	}
-	return nil
+	return t
 }
 
 // Postgres clips to whole characters; cutting mid-rune would break the name.

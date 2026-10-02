@@ -42,6 +42,15 @@ type (
 		Functions        []Function      `json:"functions"`
 		Extensions       []Extension     `json:"extensions"`
 		GUCs             []GucSetting    `json:"gucs"`
+		// SearchPath is the replayable, effective schema resolution order for
+		// the capturing role at capture time: "$user" already expanded to the
+		// role name, and empty/non-existent entries dropped, in search order.
+		// Every unqualified relation name in offline analysis and in the live
+		// EXPLAIN transaction resolves along this list; an explicit schema
+		// always bypasses it. Empty on bundles captured before this field
+		// existed; those resolve the legacy way, as ["public"]. It is DDL
+		// context, not DDL itself, so it stays out of the content hash.
+		SearchPath []string `json:"search_path,omitempty"`
 	}
 
 	Table struct {

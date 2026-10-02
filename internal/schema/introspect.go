@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/boringsql/queries"
@@ -148,6 +149,9 @@ func IntrospectSchema(ctx context.Context, pool Querier) (*SchemaSnapshot, error
 	if err != nil {
 		return nil, fmt.Errorf("fetch gucs: %w", err)
 	}
+	// Resolution context, not DDL: a read failure degrades to the legacy
+	// public-only rule, it must not lose the whole schema capture.
+	searchPath := fetchSearchPath(ctx, pool)
 
 	flavor := detectFlavor(ctx, pool, extensions)
 
@@ -179,6 +183,7 @@ func IntrospectSchema(ctx context.Context, pool Querier) (*SchemaSnapshot, error
 		Functions:     functions,
 		Extensions:    extensions,
 		GUCs:          gucs,
+		SearchPath:    searchPath,
 	}
 	snap.ContentHash = DigestFor(snap)
 	return snap, nil
@@ -654,6 +659,38 @@ func fetchGUCs(ctx context.Context, pool Querier) ([]GucSetting, error) {
 		err := r.Scan(&g.Name, &g.Setting, &g.Unit)
 		return g, err
 	})
+}
+
+// fetchSearchPath resolves the role's effective search_path to existing
+// schemas in search order. Best-effort: any read error or an unreadable row
+// is logged and left empty, so consumers fall back to legacy ["public"]
+// rather than losing the capture. Repeats collapse to first occurrence.
+func fetchSearchPath(ctx context.Context, pool Querier) []string {
+	rows, err := query(ctx, pool, "fetch-search-path")
+	if err != nil {
+		slog.Warn("fetch search_path failed, resolving unqualified names as public", "err", err)
+		return nil
+	}
+	names, err := scanAll(rows, func(r pgx.Rows) (string, error) {
+		var name string
+		err := r.Scan(&name)
+		return name, err
+	})
+	if err != nil {
+		slog.Warn("scan search_path failed, resolving unqualified names as public", "err", err)
+		return nil
+	}
+	out := make([]string, 0, len(names))
+	seen := make(map[string]bool, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		out = append(out, name)
+	}
+	return out
 }
 
 // Assembly: merge parts into Table structs

@@ -104,7 +104,11 @@ func detectPartitionPruningIssues(node *PlanNode, snap *schema.SchemaSnapshot, w
 		if child.RelationName == nil {
 			continue
 		}
-		p, _ := findPartitionParent(*child.RelationName, snap)
+		childSchema := ""
+		if child.Schema != nil {
+			childSchema = *child.Schema
+		}
+		p, _ := findPartitionParent(childSchema, *child.RelationName, snap)
 		if p == nil {
 			continue
 		}
@@ -161,7 +165,11 @@ func detectCTEMaterialized(node *PlanNode, snap *schema.SchemaSnapshot, warnings
 		if (child.NodeType == "Append" || child.NodeType == "Merge Append") && snap != nil {
 			for j := range child.Children {
 				if child.Children[j].RelationName != nil {
-					if p, _ := findPartitionParent(*child.Children[j].RelationName, snap); p != nil {
+					childSchema := ""
+					if child.Children[j].Schema != nil {
+						childSchema = *child.Children[j].Schema
+					}
+					if p, _ := findPartitionParent(childSchema, *child.Children[j].RelationName, snap); p != nil {
 						qualified := p.Schema + "." + p.Name
 						e = jit.CTEOverPartitionedTable(cteName, qualified)
 						break
@@ -178,19 +186,55 @@ func detectCTEMaterialized(node *PlanNode, snap *schema.SchemaSnapshot, warnings
 	})
 }
 
-func findPartitionParent(childTableName string, snap *schema.SchemaSnapshot) (*schema.Table, string) {
+// findPartitionParent matches a scanned partition child back to its parent.
+// A plan-provided schema is matched exactly; a bare name (pasted plan
+// without schema) picks the parent whose child sits earliest on the
+// captured search_path, never a same-named child from another schema.
+func findPartitionParent(childSchema, childTableName string, snap *schema.SchemaSnapshot) (*schema.Table, string) {
+	if snap == nil {
+		return nil, ""
+	}
+	if childSchema != "" {
+		for i := range snap.Tables {
+			t := &snap.Tables[i]
+			if t.PartitionInfo == nil {
+				continue
+			}
+			for _, child := range t.PartitionInfo.Children {
+				if child.Name == childTableName && child.Schema == childSchema {
+					return t, t.PartitionInfo.Key
+				}
+			}
+		}
+		return nil, ""
+	}
+
+	rank := map[string]int{}
+	for i, sch := range schema.EffectiveSearchPath(snap) {
+		rank[sch] = i
+	}
+	var best *schema.Table
+	var bestKey string
+	bestRank := int(^uint(0) >> 1)
 	for i := range snap.Tables {
 		t := &snap.Tables[i]
 		if t.PartitionInfo == nil {
 			continue
 		}
 		for _, child := range t.PartitionInfo.Children {
-			if child.Name == childTableName {
-				return t, t.PartitionInfo.Key
+			if child.Name != childTableName {
+				continue
+			}
+			r, ok := rank[child.Schema]
+			if !ok {
+				r = len(rank) // schemas off the path lose to on-path ones
+			}
+			if r < bestRank {
+				best, bestKey, bestRank = t, t.PartitionInfo.Key, r
 			}
 		}
 	}
-	return nil, ""
+	return best, bestKey
 }
 
 func detectHighRowsRemoved(node *PlanNode, warnings *[]PlanWarning) {

@@ -116,7 +116,7 @@ func (s *Server) registerSchemaTools(srv *mcpserver.MCPServer) {
 		mcp.NewTool("describe_table",
 			mcp.WithDescription("Before writing SQL against a table you have not read in this session, before a JOIN, or before a DELETE that might cascade: one table in full -- its columns and types, constraints, indexes, and planner stats. Needs no database connection; answers from the snapshot, and points at detect when the table has findings. detail=relations gives the incoming and outgoing foreign keys, each with a JOIN clause you can paste and the ON DELETE / ON UPDATE action it carries (declared constraints only, one hop, so a table reached by a cascade may cascade further). detail=stats adds vacuum: dead tuples, trigger points, effective autovacuum knobs and last vacuum/analyze times, for any table over 10k rows whether or not detect flagged it. Ask for the ddl field to get the CREATE TABLE that would rebuild it, with whatever the snapshot cannot reproduce listed beside it. Structure as of the last capture: no row data, and nothing a later migration changed."),
 			mcp.WithString("table", mcp.Required(), mcp.Description("Table name, bare or schema-qualified.")),
-			mcp.WithString("schema", mcp.Description("Schema name. Without it a bare name resolves in public, or in the one schema that holds it.")),
+			mcp.WithString("schema", mcp.Description("Schema name. Without it a bare name resolves along the snapshot's captured search_path (older snapshots: public), or in the one schema that holds it.")),
 			mcp.WithString("detail",
 				mcp.Enum("summary", "full", "stats", "relations"),
 				mcp.DefaultString("summary"),

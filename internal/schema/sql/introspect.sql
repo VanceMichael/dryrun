@@ -313,6 +313,36 @@ SELECT e.extname   AS ext_name,
   JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
  ORDER BY e.extname
 
+-- Effective, replayable search_path for the capturing role: "$user" is
+-- expanded to the role name (and dropped when no such schema/role exists),
+-- the "" empty-schema marker and names that do not resolve to a namespace
+-- are dropped, and search order is preserved. Only schemas present in
+-- pg_namespace survive, which is exactly the list Postgres walks.
+-- name: fetch-search-path
+WITH parts(ord, token) AS (
+    SELECT u.ord, btrim(u.token)
+      FROM (SELECT pg_catalog.current_setting('search_path') AS setting) AS raw,
+           unnest(string_to_array(raw.setting, ',')) WITH ORDINALITY AS u(token, ord)
+),
+expanded(ord, nspname) AS (
+    SELECT parts.ord,
+           CASE
+               WHEN lower(parts.token) IN ('$user', '"$user"')
+                   THEN (SELECT r.rolname
+                           FROM pg_catalog.pg_roles r
+                          WHERE r.rolname = current_user)
+               WHEN parts.token = '""' THEN NULL
+               ELSE btrim(parts.token, '"')
+           END
+      FROM parts
+)
+SELECT e.nspname
+  FROM expanded e
+ WHERE e.nspname IS NOT NULL
+   AND e.nspname <> ''
+   AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = e.nspname)
+ ORDER BY e.ord
+
 -- name: fetch-gucs
 SELECT name, setting, unit
   FROM pg_catalog.pg_settings

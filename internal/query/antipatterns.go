@@ -7,13 +7,13 @@ import (
 	"github.com/boringsql/dryrun/internal/schema"
 )
 
-func detectAntipatterns(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
+func detectAntipatterns(parsed *ParsedQuery, resolver *schema.Resolver, warnings *[]ValidationWarning) {
 	detectSelectStar(parsed, warnings)
-	detectUnboundedQuery(parsed, snap, warnings)
+	detectUnboundedQuery(parsed, warnings)
 	detectCartesianJoin(parsed, warnings)
 	detectDMLWithoutWhere(parsed, warnings)
-	detectPartitionKeyAntipatterns(parsed, snap, warnings)
-	detectPartitionKeyUpdate(parsed, snap, warnings)
+	detectPartitionKeyAntipatterns(parsed, resolver, warnings)
+	detectPartitionKeyUpdate(parsed, resolver, warnings)
 	detectUnvalidatedProceduralBody(parsed, warnings)
 }
 
@@ -42,22 +42,14 @@ func detectSelectStar(parsed *ParsedQuery, warnings *[]ValidationWarning) {
 	}
 }
 
-func detectUnboundedQuery(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
+func detectUnboundedQuery(parsed *ParsedQuery, warnings *[]ValidationWarning) {
+	// table-size refinement requires AnnotatedSchema; ValidateQuery doesn't
+	// carry one, so this detector is currently a placeholder
 	if parsed.Info.StatementType != "SELECT" {
 		return
 	}
 	if parsed.Info.HasWhere || parsed.Info.HasLimit {
 		return
-	}
-
-	for _, ref := range parsed.Info.Tables {
-		schemaName := "public"
-		if ref.Schema != nil {
-			schemaName = *ref.Schema
-		}
-		// table-size refinement requires AnnotatedSchema; ValidateQuery doesn't carry one
-		_ = schemaName
-		_ = ref
 	}
 }
 
@@ -147,100 +139,87 @@ func detectDMLWithoutWhere(parsed *ParsedQuery, warnings *[]ValidationWarning) {
 	}
 }
 
-func detectPartitionKeyAntipatterns(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
+func detectPartitionKeyAntipatterns(parsed *ParsedQuery, resolver *schema.Resolver, warnings *[]ValidationWarning) {
 	for _, ref := range parsed.Info.Tables {
-		schemaName := "public"
-		if ref.Schema != nil {
-			schemaName = *ref.Schema
+		t, _, ok := resolveRefTable(resolver, ref)
+		if !ok || t.PartitionInfo == nil {
+			continue
 		}
 
-		for i := range snap.Tables {
-			t := &snap.Tables[i]
-			if t.Name != ref.Name || t.Schema != schemaName {
-				continue
-			}
-			if t.PartitionInfo == nil {
-				break
-			}
+		keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
+		found := false
 
-			keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
-			found := false
-
-			for _, kc := range keyColumns {
-				for _, fc := range parsed.Info.FilterColumns {
-					if strings.EqualFold(fc.Column, kc) {
-						found = true
-						break
-					}
-				}
-				if found {
+		for _, kc := range keyColumns {
+			for _, fc := range parsed.Info.FilterColumns {
+				if strings.EqualFold(fc.Column, kc) {
+					found = true
 					break
 				}
 			}
-
-			if !found {
-				*warnings = append(*warnings, ValidationWarning{
-					Severity: SeverityWarning,
-					Message: fmt.Sprintf(
-						"query on partitioned table '%s.%s' (%s on '%s', %d partitions) "+
-							"does not filter on partition key; all partitions will be scanned",
-						t.Schema, t.Name, t.PartitionInfo.Strategy, t.PartitionInfo.Key,
-						len(t.PartitionInfo.Children)),
-				})
+			if found {
+				break
 			}
+		}
 
-			for _, kc := range keyColumns {
-				for _, fwc := range parsed.Info.FuncWrappedColumns {
-					if strings.EqualFold(fwc.Column, kc) {
-						*warnings = append(*warnings, ValidationWarning{
-							Severity: SeverityWarning,
-							Message: fmt.Sprintf(
-								"partition key '%s' on '%s.%s' is wrapped in %s - this prevents partition pruning. %s",
-								kc, t.Schema, t.Name, fwc.FuncName, funcWrapRewriteHint(fwc.FuncName, kc)),
-						})
-					}
+		if !found {
+			*warnings = append(*warnings, ValidationWarning{
+				Severity: SeverityWarning,
+				Message: fmt.Sprintf(
+					"query on partitioned table '%s.%s' (%s on '%s', %d partitions) "+
+						"does not filter on partition key; all partitions will be scanned",
+					t.Schema, t.Name, t.PartitionInfo.Strategy, t.PartitionInfo.Key,
+					len(t.PartitionInfo.Children)),
+			})
+		}
+
+		for _, kc := range keyColumns {
+			for _, fwc := range parsed.Info.FuncWrappedColumns {
+				if strings.EqualFold(fwc.Column, kc) {
+					*warnings = append(*warnings, ValidationWarning{
+						Severity: SeverityWarning,
+						Message: fmt.Sprintf(
+							"partition key '%s' on '%s.%s' is wrapped in %s - this prevents partition pruning. %s",
+							kc, t.Schema, t.Name, fwc.FuncName, funcWrapRewriteHint(fwc.FuncName, kc)),
+					})
 				}
 			}
-			break
 		}
 	}
 }
 
-func detectPartitionKeyUpdate(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
+func detectPartitionKeyUpdate(parsed *ParsedQuery, resolver *schema.Resolver, warnings *[]ValidationWarning) {
 	if parsed.Info.StatementType != "UPDATE" || len(parsed.Info.UpdateTargets) == 0 {
 		return
 	}
 
 	for _, ref := range parsed.Info.Tables {
-		schemaName := "public"
-		if ref.Schema != nil {
-			schemaName = *ref.Schema
+		t, _, ok := resolveRefTable(resolver, ref)
+		if !ok || t.PartitionInfo == nil {
+			continue
 		}
 
-		for i := range snap.Tables {
-			t := &snap.Tables[i]
-			if t.Name != ref.Name || t.Schema != schemaName {
-				continue
-			}
-			if t.PartitionInfo == nil {
-				break
-			}
-
-			keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
-			for _, kc := range keyColumns {
-				for _, ut := range parsed.Info.UpdateTargets {
-					if strings.EqualFold(ut, kc) {
-						*warnings = append(*warnings, ValidationWarning{
-							Severity: SeverityWarning,
-							Message: fmt.Sprintf(
-								"UPDATE changes partition key '%s' on partitioned table '%s.%s'. This causes cross-partition row movement (DELETE + INSERT)", kc, t.Schema, t.Name),
-						})
-					}
+		keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
+		for _, kc := range keyColumns {
+			for _, ut := range parsed.Info.UpdateTargets {
+				if strings.EqualFold(ut, kc) {
+					*warnings = append(*warnings, ValidationWarning{
+						Severity: SeverityWarning,
+						Message: fmt.Sprintf(
+							"UPDATE changes partition key '%s' on partitioned table '%s.%s'. This causes cross-partition row movement (DELETE + INSERT)", kc, t.Schema, t.Name),
+					})
 				}
 			}
-			break
 		}
 	}
+}
+
+// resolveRefTable applies the shared search_path rule to a parsed reference.
+func resolveRefTable(resolver *schema.Resolver, ref ReferencedTable) (*schema.Table, schema.QualifiedName, bool) {
+	explicit := ""
+	if ref.Schema != nil {
+		explicit = *ref.Schema
+	}
+	return resolver.ResolveTable(explicit, ref.Name)
 }
 
 func funcWrapRewriteHint(funcName, col string) string {

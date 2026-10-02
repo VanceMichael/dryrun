@@ -3,6 +3,7 @@ package query
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/boringsql/dryrun/internal/schema"
 )
@@ -97,66 +98,53 @@ func validate(sql string, snap *schema.SchemaSnapshot) (*ValidationResult, fixPl
 		resolvedStar []ResolvedStar
 	)
 
+	// one resolver for the whole pass: every step reads the same object for
+	// the same name, along the snapshot's captured search_path
+	resolver := schema.NewResolver(snap)
+
 	// check each referenced table exists
 	for _, ref := range parsed.Info.Tables {
 		if ref.Schema == nil && slices.Contains(parsed.Info.cteNames, ref.Name) {
 			continue
 		}
-		tableName := ref.Name
-		schemaName := "public"
+		explicit := ""
 		if ref.Schema != nil {
-			schemaName = *ref.Schema
+			explicit = *ref.Schema
 		}
-
-		found := false
-		for _, t := range snap.Tables {
-			if t.Name == tableName && t.Schema == schemaName {
-				found = true
-				break
-			}
-		}
-		if !found {
-			isView := false
-			for _, v := range snap.Views {
-				if v.Name == tableName && v.Schema == schemaName {
-					isView = true
-					break
-				}
-			}
-			if !isView {
-				errors = append(errors, fmt.Sprintf(
-					"table or view '%s.%s' does not exist", schemaName, tableName))
-				plan.add(tableFix(snap, schemaName, ref))
-			}
+		if _, _, ok := resolver.LookupRelation(explicit, ref.Name); !ok {
+			errors = append(errors, missingRelationMessage(ref, resolver))
+			plan.add(tableFix(resolver, ref))
 		}
 	}
 
-	validateReferencedColumns(parsed, snap, &errors, &plan)
+	validateReferencedColumns(parsed, resolver, &errors, &plan)
 
 	// resolve SELECT *
 	if parsed.Info.HasSelectStar {
 		for _, ref := range parsed.Info.Tables {
-			schemaName := "public"
+			if ref.Schema == nil && slices.Contains(parsed.Info.cteNames, ref.Name) {
+				continue
+			}
+			explicit := ""
 			if ref.Schema != nil {
-				schemaName = *ref.Schema
+				explicit = *ref.Schema
 			}
-			for _, t := range snap.Tables {
-				if t.Name == ref.Name && t.Schema == schemaName {
-					cols := make([]string, len(t.Columns))
-					for i, c := range t.Columns {
-						cols[i] = c.Name
-					}
-					resolvedStar = append(resolvedStar, ResolvedStar{
-						Table:   t.Schema + "." + t.Name,
-						Columns: cols,
-					})
-					break
-				}
+			t, _, ok := resolver.ResolveTable(explicit, ref.Name)
+			if !ok {
+				continue
 			}
+			cols := make([]string, len(t.Columns))
+			for i, c := range t.Columns {
+				cols[i] = c.Name
+			}
+			resolvedStar = append(resolvedStar, ResolvedStar{
+				Table:   t.Schema + "." + t.Name,
+				Columns: cols,
+			})
 		}
 	}
 
-	detectAntipatterns(parsed, snap, &warnings)
+	detectAntipatterns(parsed, resolver, &warnings)
 
 	return &ValidationResult{
 		Valid:               len(errors) == 0,
@@ -167,7 +155,7 @@ func validate(sql string, snap *schema.SchemaSnapshot) (*ValidationResult, fixPl
 	}, plan, nil
 }
 
-func validateReferencedColumns(parsed *ParsedQuery, snap *schema.SchemaSnapshot, errors *[]string, plan *fixPlan) {
+func validateReferencedColumns(parsed *ParsedQuery, resolver *schema.Resolver, errors *[]string, plan *fixPlan) {
 	for _, fc := range parsed.Info.ReferencedColumns {
 		if fc.Table == nil {
 			continue
@@ -187,34 +175,51 @@ func validateReferencedColumns(parsed *ParsedQuery, snap *schema.SchemaSnapshot,
 			continue
 		}
 
-		schemaName := "public"
+		explicit := ""
 		if ref.Schema != nil {
-			schemaName = *ref.Schema
+			explicit = *ref.Schema
 		}
-		for _, t := range snap.Tables {
-			if t.Name == ref.Name && t.Schema == schemaName {
-				found := false
-				for _, c := range t.Columns {
-					if c.Name == fc.Column {
-						found = true
-						break
-					}
-				}
-				if !found {
-					*errors = append(*errors, fmt.Sprintf(
-						"column '%s' does not exist on table '%s.%s'",
-						fc.Column, t.Schema, t.Name))
-					plan.add(columnFix(&t, alias, fc))
-				}
+		t, _, ok := resolver.ResolveTable(explicit, ref.Name)
+		if !ok {
+			// the missing table already has its own error and fix; do not
+			// pile column errors or pick another schema's columns
+			continue
+		}
+		found := false
+		for _, c := range t.Columns {
+			if c.Name == fc.Column {
+				found = true
 				break
 			}
+		}
+		if !found {
+			*errors = append(*errors, fmt.Sprintf(
+				"column '%s' does not exist on table '%s.%s'",
+				fc.Column, t.Schema, t.Name))
+			plan.add(columnFix(t, alias, fc))
 		}
 	}
 }
 
-// An unqualified name that exists in exactly one other schema is a missing
-// qualifier, not a typo; that outranks any distance guess.
-func tableFix(snap *schema.SchemaSnapshot, schemaName string, ref ReferencedTable) *pendingFix {
+// missingRelationMessage is the one stable diagnostic for an unresolvable
+// reference. An explicit qualifier names it verbatim; an unqualified name on
+// a multi-schema path also names the schemas Postgres walked, in order, so
+// the same query always yields the same message.
+func missingRelationMessage(ref ReferencedTable, resolver *schema.Resolver) string {
+	if ref.Schema != nil {
+		return fmt.Sprintf("table or view '%s.%s' does not exist", *ref.Schema, ref.Name)
+	}
+	path := resolver.Path()
+	if len(path) == 1 && path[0] == schema.LegacyDefaultSchema {
+		return fmt.Sprintf("table or view '%s.%s' does not exist", schema.LegacyDefaultSchema, ref.Name)
+	}
+	return fmt.Sprintf("table or view '%s' does not exist (searched schemas: %s)",
+		ref.Name, strings.Join(path, ", "))
+}
+
+// An unqualified name that exists in exactly one schema off the search_path
+// is a missing qualifier, not a typo; that outranks any distance guess.
+func tableFix(resolver *schema.Resolver, ref ReferencedTable) *pendingFix {
 	written := ref.Name
 	if ref.Schema != nil {
 		written = *ref.Schema + "." + ref.Name
@@ -228,34 +233,45 @@ func tableFix(snap *schema.SchemaSnapshot, schemaName string, ref ReferencedTabl
 	}
 
 	if ref.Schema == nil {
-		var elsewhere []string
-		for _, r := range relations(snap) {
-			if r.name == ref.Name && r.schema != schemaName {
-				elsewhere = append(elsewhere, r.schema)
-			}
+		// the name failed resolution along the path, so every holder is
+		// necessarily off it; one holder qualifies unambiguously
+		holders := resolver.AllNamedRelations(ref.Name)
+		if len(holders) == 1 {
+			return mk(holders[0].Schema + "." + ref.Name)
 		}
-		if len(elsewhere) == 1 {
-			return mk(elsewhere[0] + "." + ref.Name)
-		}
-		if len(elsewhere) > 1 {
+		if len(holders) > 1 {
 			return nil
 		}
-	}
 
-	var pool []string
-	for _, r := range relations(snap) {
-		if r.schema == schemaName {
-			pool = append(pool, r.name)
+		// typo candidates stay unqualified: the pool is every bare name
+		// reachable along the path, so a bare replacement resolves exactly
+		// as intended
+		var pool []string
+		seen := map[string]bool{}
+		for _, sch := range resolver.Path() {
+			for _, q := range resolver.AllNamedRelationsInSchema(sch) {
+				if !seen[q.Name] {
+					seen[q.Name] = true
+					pool = append(pool, q.Name)
+				}
+			}
 		}
-	}
-	cand, ok := bestCandidate(ref.Name, pool)
-	if !ok {
+		if cand, ok := bestCandidate(ref.Name, pool); ok {
+			return mk(cand)
+		}
 		return nil
 	}
-	if ref.Schema != nil {
+
+	// explicit qualifier: candidates come from the named schema only, and
+	// the qualifier is preserved
+	var pool []string
+	for _, q := range resolver.AllNamedRelationsInSchema(*ref.Schema) {
+		pool = append(pool, q.Name)
+	}
+	if cand, ok := bestCandidate(ref.Name, pool); ok {
 		return mk(*ref.Schema + "." + cand)
 	}
-	return mk(cand)
+	return nil
 }
 
 func columnFix(t *schema.Table, alias string, fc FilterColumn) *pendingFix {
@@ -275,17 +291,4 @@ func columnFix(t *schema.Table, alias string, fc FilterColumn) *pendingFix {
 		lastOnly: true,
 		expect:   []string{alias + "." + fc.Column},
 	}
-}
-
-type relation struct{ schema, name string }
-
-func relations(snap *schema.SchemaSnapshot) []relation {
-	out := make([]relation, 0, len(snap.Tables)+len(snap.Views))
-	for _, t := range snap.Tables {
-		out = append(out, relation{t.Schema, t.Name})
-	}
-	for _, v := range snap.Views {
-		out = append(out, relation{v.Schema, v.Name})
-	}
-	return out
 }

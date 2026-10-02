@@ -56,6 +56,8 @@ type (
 	AnnotatedSchema          = snapshot.AnnotatedSchema
 	MergedActivity           = snapshot.MergedActivity
 	NodeActivity             = snapshot.NodeActivity
+	Resolver                 = snapshot.Resolver
+	RelationKind             = snapshot.RelationKind
 )
 
 // Enum values.
@@ -80,6 +82,12 @@ const (
 	FlavorPostgres       = snapshot.FlavorPostgres
 	FlavorAlloyDBOmni    = snapshot.FlavorAlloyDBOmni
 	FlavorAlloyDBManaged = snapshot.FlavorAlloyDBManaged
+
+	RelNone  = snapshot.RelNone
+	RelTable = snapshot.RelTable
+	RelView  = snapshot.RelView
+
+	LegacyDefaultSchema = snapshot.LegacyDefaultSchema
 )
 
 // Functions.
@@ -100,4 +108,8 @@ var (
 	ComputePlannerContentHash    = snapshot.ComputePlannerContentHash
 	ComputeActivityContentHash   = snapshot.ComputeActivityContentHash
 	ComputeQueryStatsContentHash = snapshot.ComputeQueryStatsContentHash
+
+	NewResolver           = snapshot.NewResolver
+	EffectiveSearchPath   = snapshot.EffectiveSearchPath
+	SearchPathSetting     = snapshot.SearchPathSetting
 )

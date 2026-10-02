@@ -8,6 +8,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/boringsql/dryrun/internal/schema"
 	"github.com/boringsql/dryrun/pkg/lint"
 )
 
@@ -118,6 +119,57 @@ func TestResolveTable_NextCallCarriesResolvedName(t *testing.T) {
 		got.Args["schema"] != "public" || got.Args["detail"] != "relations" {
 		t.Errorf("want describe_table{table: orders, schema: public, detail: relations}, got %s%v", got.Tool, got.Args)
 	}
+}
+
+// With a captured search_path, a bare name follows that path rather than
+// defaulting to public: describe_table must agree with offline validation.
+func TestResolveTable_FollowsCapturedSearchPath(t *testing.T) {
+	snap := finish(&schema.SchemaSnapshot{
+		SearchPath: []string{"app", "public"},
+		Tables: []schema.Table{
+			testTable("app", "orders", testCol("app_marker", "text", true)),
+			testTable("public", "orders", testCol("pub_marker", "text", true)),
+			testTable("archive", "lone", testCol("id", "integer", false)),
+		},
+	})
+	c := serveOffline(t, NewOfflineServerAnnotated(annotate(snap, 1000), lint.DefaultConfig()))
+
+	// path order: app shadows public
+	out := callTool(t, c, "describe_table", map[string]any{"table": "orders"})
+	assertContains(t, out, `"schema": "app"`)
+	assertContains(t, out, `"name": "app_marker"`)
+
+	// explicit qualifier is authoritative
+	out = callTool(t, c, "describe_table", map[string]any{"table": "public.orders"})
+	assertContains(t, out, `"schema": "public"`)
+	assertContains(t, out, `"name": "pub_marker"`)
+
+	// one off-path holder still resolves, flagged with a qualification note
+	out = callTool(t, c, "describe_table", map[string]any{"table": "lone"})
+	assertContains(t, out, `"schema": "archive"`)
+	assertContains(t, out, "not on the snapshot's search_path")
+
+	// nothing on or off the path: stable diagnostic naming the path
+	out = callTool(t, c, "describe_table", map[string]any{"table": "ghost"})
+	assertContains(t, out, "table 'ghost' not found (searched schemas: app, public)")
+}
+
+// Two servers over two snapshots (different profiles/databases) never share
+// resolution state: each bare name resolves against its own snapshot.
+func TestResolveTable_ResolutionStateIsPerSnapshot(t *testing.T) {
+	appFirst := finish(&schema.SchemaSnapshot{
+		SearchPath: []string{"app", "public"},
+		Tables:     []schema.Table{testTable("app", "orders"), testTable("public", "orders")},
+	})
+	publicFirst := finish(&schema.SchemaSnapshot{
+		SearchPath: []string{"public", "app"},
+		Tables:     []schema.Table{testTable("app", "orders"), testTable("public", "orders")},
+	})
+	s1 := serveOffline(t, NewOfflineServerAnnotated(annotate(appFirst, 1000), lint.DefaultConfig()))
+	s2 := serveOffline(t, NewOfflineServerAnnotated(annotate(publicFirst, 1000), lint.DefaultConfig()))
+
+	assertContains(t, callTool(t, s1, "describe_table", map[string]any{"table": "orders"}), `"schema": "app"`)
+	assertContains(t, callTool(t, s2, "describe_table", map[string]any{"table": "orders"}), `"schema": "public"`)
 }
 
 // Resolution needs the snapshot, so it must run after the loaded check; moving

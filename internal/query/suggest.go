@@ -26,30 +26,28 @@ func SuggestIndex(sql string, snap *schema.SchemaSnapshot, plan *PlanNode) ([]In
 
 	var suggestions []IndexSuggestion
 
+	resolver := schema.NewResolver(snap)
 	if plan != nil {
-		suggestFromPlan(plan, snap, &suggestions)
+		suggestFromPlan(plan, resolver, &suggestions)
 	}
-	suggestFromQueryStructure(parsed, snap, &suggestions)
+	suggestFromQueryStructure(parsed, resolver, &suggestions)
 	dedupSuggestions(&suggestions)
 
 	return suggestions, nil
 }
 
-func suggestFromPlan(node *PlanNode, snap *schema.SchemaSnapshot, suggestions *[]IndexSuggestion) {
+func suggestFromPlan(node *PlanNode, resolver *schema.Resolver, suggestions *[]IndexSuggestion) {
 	if node.NodeType == "Seq Scan" && node.PlanRows >= 1000 && node.RelationName != nil {
 		tableName := *node.RelationName
-		schemaName := "public"
+		// EXPLAIN output always names the schema; pasted plans without one
+		// resolve along the captured search_path
+		explicit := ""
 		if node.Schema != nil {
-			schemaName = *node.Schema
+			explicit = *node.Schema
 		}
 
-		var table *schema.Table
-		for i := range snap.Tables {
-			if snap.Tables[i].Name == tableName && snap.Tables[i].Schema == schemaName {
-				table = &snap.Tables[i]
-				break
-			}
-		}
+		table, q, _ := resolver.ResolveTable(explicit, tableName)
+		schemaName := q.Schema
 
 		if node.Filter != nil {
 			col := extractSuggestFilterColumn(*node.Filter)
@@ -93,11 +91,11 @@ func suggestFromPlan(node *PlanNode, snap *schema.SchemaSnapshot, suggestions *[
 	}
 
 	for i := range node.Children {
-		suggestFromPlan(&node.Children[i], snap, suggestions)
+		suggestFromPlan(&node.Children[i], resolver, suggestions)
 	}
 }
 
-func suggestFromQueryStructure(parsed *ParsedQuery, snap *schema.SchemaSnapshot, suggestions *[]IndexSuggestion) {
+func suggestFromQueryStructure(parsed *ParsedQuery, resolver *schema.Resolver, suggestions *[]IndexSuggestion) {
 	for _, fc := range parsed.Info.FilterColumns {
 		var ref *ReferencedTable
 		if fc.Table != nil {
@@ -116,19 +114,8 @@ func suggestFromQueryStructure(parsed *ParsedQuery, snap *schema.SchemaSnapshot,
 			continue
 		}
 
-		schemaName := "public"
-		if ref.Schema != nil {
-			schemaName = *ref.Schema
-		}
-
-		var table *schema.Table
-		for i := range snap.Tables {
-			if snap.Tables[i].Name == ref.Name && snap.Tables[i].Schema == schemaName {
-				table = &snap.Tables[i]
-				break
-			}
-		}
-		if table == nil {
+		table, _, ok := resolveRefTable(resolver, *ref)
+		if !ok {
 			continue
 		}
 

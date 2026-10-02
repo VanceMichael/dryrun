@@ -21,8 +21,11 @@ type (
 		StatsInjected *schema.InjectResult `json:"stats_injected,omitempty"`
 		GucsReplayed  []string             `json:"gucs_replayed,omitempty"`
 		GucsSkipped   []SkippedGuc         `json:"gucs_skipped,omitempty"`
-		PgMustardTips []pgmustard.Tip      `json:"pgmustard_tips,omitempty"`
-		RawPlanJSON   json.RawMessage      `json:"-"`
+		// search_path applied with SET LOCAL before EXPLAIN, rendered as the
+		// captured effective order; absent when no snapshot supplied it
+		SearchPathReplayed string        `json:"search_path_replayed,omitempty"`
+		PgMustardTips      []pgmustard.Tip `json:"pgmustard_tips,omitempty"`
+		RawPlanJSON        json.RawMessage `json:"-"`
 	}
 
 	PlanWarning struct {
@@ -48,19 +51,33 @@ func ExplainQuery(ctx context.Context, pool *pgxpool.Pool, sql string, analyze b
 	}
 
 	replayGUCs := snap != nil && len(snap.GUCs) > 0
+	// replay the name-resolution context too: unqualified names in the
+	// statement must resolve to the same relations the offline analysis used,
+	// not to whatever the live role's default search_path would pick
+	searchPath := ""
+	if snap != nil {
+		searchPath = schema.SearchPathSetting(snap)
+	}
 
 	var (
 		jsonStr  string
 		replayed []string
 		skipped  []SkippedGuc
 	)
-	if analyze || replayGUCs {
+	if analyze || replayGUCs || searchPath != "" {
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("begin transaction: %w", err)
 		}
 		defer tx.Rollback(ctx)
 
+		if searchPath != "" {
+			// SET LOCAL inside the rolled-back tx; a schema that vanished
+			// after capture is skipped by Postgres, not an error
+			if _, err := tx.Exec(ctx, "SELECT set_config('search_path', $1, true)", searchPath); err != nil {
+				return nil, fmt.Errorf("replay search_path: %w", err)
+			}
+		}
 		if replayGUCs {
 			replayed, skipped, err = applyPlannerGUCs(ctx, tx, snap.GUCs)
 			if err != nil {
@@ -119,13 +136,14 @@ func ExplainQuery(ctx context.Context, pool *pgxpool.Pool, sql string, analyze b
 	warnings := DetectPlanWarnings(plan, snap)
 
 	return &ExplainResult{
-		Plan:          *plan,
-		TotalCost:     plan.TotalCost,
-		EstimatedRows: plan.PlanRows,
-		Warnings:      warnings,
-		Execution:     execution,
-		GucsReplayed:  replayed,
-		GucsSkipped:   skipped,
-		RawPlanJSON:   planArray[0],
+		Plan:               *plan,
+		TotalCost:          plan.TotalCost,
+		EstimatedRows:      plan.PlanRows,
+		Warnings:           warnings,
+		Execution:          execution,
+		GucsReplayed:       replayed,
+		GucsSkipped:        skipped,
+		SearchPathReplayed: searchPath,
+		RawPlanJSON:        planArray[0],
 	}, nil
 }

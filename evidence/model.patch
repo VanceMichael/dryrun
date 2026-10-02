@@ -1,0 +1,2705 @@
+diff --git a/internal/mcp/params.go b/internal/mcp/params.go
+index 95f9626..0cf4f5b 100644
+--- a/internal/mcp/params.go
++++ b/internal/mcp/params.go
+@@ -64,9 +64,10 @@ func getBoolArg(req mcp.CallToolRequest, key string) bool {
+ 	return b
+ }
+ 
+-// Lookup tools answer about one object and need a schema to resolve against.
++// Lookup tools resolve a missing schema against the snapshot's captured
++// search_path, never a hard-coded default; callers take the raw argument.
+ func schemaArg(req mcp.CallToolRequest) string {
+-	return argOr(req, "schema", "public")
++	return getArg(req, "schema")
+ }
+ 
+ // Filter tools must not default: absent means every schema, not "public".
+diff --git a/internal/mcp/resolve.go b/internal/mcp/resolve.go
+index 74f1e2f..3df6370 100644
+--- a/internal/mcp/resolve.go
++++ b/internal/mcp/resolve.go
+@@ -25,57 +25,78 @@ const maxNearMatches = 5
+ 
+ // Order matters. A table name may legally contain a dot ("foo.bar"), so the
+ // literal argument is tried before any split; an explicit schema is never
+-// overridden by one; and a bare name that lives in several schemas is reported
+-// rather than guessed.
++// overridden by one; a bare argument resolves along the snapshot's captured
++// search_path; and a name that sits in several schemas off that path is
++// reported rather than guessed.
+ func resolveTable(snap *schema.SchemaSnapshot, req mcp.CallToolRequest) (tableRef, *mcp.CallToolResult) {
+ 	raw := getArg(req, "table")
+ 	if raw == "" {
+ 		return tableRef{}, errResult("table argument is required")
+ 	}
+ 	explicit := getArg(req, "schema")
+-	lookIn := explicit
+-	if lookIn == "" {
+-		lookIn = "public"
++	resolver := schema.NewResolver(snap)
++
++	// the schema= argument is an explicit qualifier: it is final and never
++	// falls through to search_path
++	if explicit != "" {
++		if t := findTable(snap, explicit, raw); t != nil {
++			return tableRef{Table: t, Schema: explicit, Name: raw}, nil
++		}
++		// split at the first dot only: a trailing dotted name still resolves
++		// (app."foo.bar"), and the schema half is the part that cannot hold one
++		if i := strings.Index(raw, "."); i > 0 {
++			schemaPart, namePart := raw[:i], raw[i+1:]
++			if t := findTable(snap, schemaPart, namePart); t != nil {
++				// the literal name was tried first and does not exist, so a
++				// qualified argument is the more specific of the two and wins
++				note := ""
++				if schemaPart != explicit {
++					note = fmt.Sprintf("resolved to %s.%s; the qualified table argument outranks schema=%s.",
++						schemaPart, namePart, explicit)
++				}
++				return tableRef{t, schemaPart, namePart, note}, nil
++			}
++		}
++		return tableRef{}, errResult(notFoundMessage(snap, explicit, raw))
+ 	}
+ 
+-	if t := findTable(snap, lookIn, raw); t != nil {
+-		return tableRef{Table: t, Schema: lookIn, Name: raw}, nil
++	// bare argument: the captured search_path order is the identity, so CLI
++	// validation and this lookup pick the same same-named table
++	if t, q, ok := resolver.ResolveTable("", raw); ok {
++		return tableRef{Table: t, Schema: q.Schema, Name: raw}, nil
+ 	}
+ 
+-	// split at the first dot only: a trailing dotted name still resolves
+-	// (app."foo.bar"), and the schema half is the part that cannot contain one
++	// a dotted argument is the caller qualifying the name inline
+ 	if i := strings.Index(raw, "."); i > 0 {
+ 		schemaPart, namePart := raw[:i], raw[i+1:]
+ 		if t := findTable(snap, schemaPart, namePart); t != nil {
+-			// the literal name was tried first and does not exist, so a
+-			// qualified argument is the more specific of the two and wins
+-			note := ""
+-			if explicit != "" && schemaPart != explicit {
+-				note = fmt.Sprintf("resolved to %s.%s; the qualified table argument outranks schema=%s.",
+-					schemaPart, namePart, explicit)
+-			}
+-			return tableRef{t, schemaPart, namePart, note}, nil
++			return tableRef{Table: t, Schema: schemaPart, Name: namePart}, nil
+ 		}
+ 	}
+ 
+-	if explicit == "" {
+-		var hits []*schema.Table
+-		for i := range snap.Tables {
+-			if snap.Tables[i].Name == raw {
+-				hits = append(hits, &snap.Tables[i])
+-			}
+-		}
+-		if len(hits) == 1 {
+-			return tableRef{Table: hits[0], Schema: hits[0].Schema, Name: hits[0].Name}, nil
+-		}
+-		if len(hits) > 1 {
+-			return tableRef{}, errResult(fmt.Sprintf(
+-				"table '%s' exists in %d schemas: %s. pass schema= to choose one.",
+-				raw, len(hits), strings.Join(qualifiedNames(hits), ", ")))
++	// nothing on the path: one holder anywhere is still unambiguous; several
++	// holders are the caller's decision
++	var hits []*schema.Table
++	for _, q := range resolver.AllNamedRelations(raw) {
++		if t := findTable(snap, q.Schema, q.Name); t != nil {
++			hits = append(hits, t)
+ 		}
+ 	}
++	if len(hits) == 1 {
++		return tableRef{
++			Table:  hits[0],
++			Schema: hits[0].Schema,
++			Name:   hits[0].Name,
++			Note:   fmt.Sprintf("resolved to %s.%s, which is not on the snapshot's search_path (%s); qualify it in SQL.", hits[0].Schema, hits[0].Name, strings.Join(resolver.Path(), ", ")),
++		}, nil
++	}
++	if len(hits) > 1 {
++		return tableRef{}, errResult(fmt.Sprintf(
++			"table '%s' exists in %d schemas: %s. pass schema= to choose one.",
++			raw, len(hits), strings.Join(qualifiedNames(hits), ", ")))
++	}
+ 
+-	return tableRef{}, errResult(notFoundMessage(snap, lookIn, raw))
++	return tableRef{}, errResult(notFoundMessage(snap, "", raw))
+ }
+ 
+ // Match is exact: relname is stored as PostgreSQL folded it at creation, so
+@@ -99,9 +120,22 @@ func qualifiedNames(tables []*schema.Table) []string {
+ }
+ 
+ // A miss ends the agent's line of enquiry unless it carries somewhere to go.
++// The message is stable: an explicit qualifier is quoted verbatim, a bare
++// name names the schemas the captured search_path walked, in that order.
+ func notFoundMessage(snap *schema.SchemaSnapshot, schemaName, raw string) string {
+-	msg := fmt.Sprintf("table '%s.%s' not found", schemaName, raw)
+-	if v := findView(snap, raw); v != "" {
++	var msg string
++	switch {
++	case schemaName != "":
++		msg = fmt.Sprintf("table '%s.%s' not found", schemaName, raw)
++	default:
++		path := schema.EffectiveSearchPath(snap)
++		if len(path) == 1 && path[0] == schema.LegacyDefaultSchema {
++			msg = fmt.Sprintf("table '%s.%s' not found", schema.LegacyDefaultSchema, raw)
++		} else {
++			msg = fmt.Sprintf("table '%s' not found (searched schemas: %s)", raw, strings.Join(path, ", "))
++		}
++	}
++	if v := findView(snap, schemaName, raw); v != "" {
+ 		return msg + fmt.Sprintf("; %s is a view, and describe_table covers tables only", v)
+ 	}
+ 	if near := nearMatches(snap, raw); len(near) > 0 {
+@@ -110,15 +144,43 @@ func notFoundMessage(snap *schema.SchemaSnapshot, schemaName, raw string) string
+ 	return msg + fmt.Sprintf(`; find_objects {"query":"%s"} searches every schema`, searchTerm(raw))
+ }
+ 
+-// A view read out of find_objects is the likeliest remaining miss.
+-func findView(snap *schema.SchemaSnapshot, raw string) string {
++// A view read out of find_objects is the likeliest remaining miss. A dotted
++// argument is matched exactly (its schema half is explicit); a bare name
++// follows the captured search_path; a lone holder elsewhere is the
++// legacy-compatible last resort.
++func findView(snap *schema.SchemaSnapshot, schemaName, raw string) string {
+ 	name := searchTerm(raw)
++	if schemaName != "" {
++		for _, v := range snap.Views {
++			if v.Name == name && v.Schema == schemaName {
++				return v.Schema + "." + v.Name
++			}
++		}
++		return ""
++	}
++	// the argument may self-qualify even without a schema= parameter
++	if i := strings.Index(raw, "."); i > 0 {
++		sp, np := raw[:i], raw[i+1:]
++		for _, v := range snap.Views {
++			if v.Name == np && v.Schema == sp {
++				return v.Schema + "." + v.Name
++			}
++		}
++		return ""
++	}
++	if v, q, ok := schema.NewResolver(snap).ResolveView("", name); ok {
++		return q.Schema + "." + v.Name
++	}
++	var hit string
+ 	for _, v := range snap.Views {
+ 		if v.Name == name {
+-			return v.Schema + "." + v.Name
++			if hit != "" {
++				return "" // several holders: name the table miss, not a guess
++			}
++			hit = v.Schema + "." + v.Name
+ 		}
+ 	}
+-	return ""
++	return hit
+ }
+ 
+ // The searchable part of a name the caller may have qualified already.
+diff --git a/internal/mcp/resolve_test.go b/internal/mcp/resolve_test.go
+index b182ef1..16a4061 100644
+--- a/internal/mcp/resolve_test.go
++++ b/internal/mcp/resolve_test.go
+@@ -8,6 +8,7 @@ import (
+ 
+ 	"github.com/mark3labs/mcp-go/mcp"
+ 
++	"github.com/boringsql/dryrun/internal/schema"
+ 	"github.com/boringsql/dryrun/pkg/lint"
+ )
+ 
+@@ -120,6 +121,57 @@ func TestResolveTable_NextCallCarriesResolvedName(t *testing.T) {
+ 	}
+ }
+ 
++// With a captured search_path, a bare name follows that path rather than
++// defaulting to public: describe_table must agree with offline validation.
++func TestResolveTable_FollowsCapturedSearchPath(t *testing.T) {
++	snap := finish(&schema.SchemaSnapshot{
++		SearchPath: []string{"app", "public"},
++		Tables: []schema.Table{
++			testTable("app", "orders", testCol("app_marker", "text", true)),
++			testTable("public", "orders", testCol("pub_marker", "text", true)),
++			testTable("archive", "lone", testCol("id", "integer", false)),
++		},
++	})
++	c := serveOffline(t, NewOfflineServerAnnotated(annotate(snap, 1000), lint.DefaultConfig()))
++
++	// path order: app shadows public
++	out := callTool(t, c, "describe_table", map[string]any{"table": "orders"})
++	assertContains(t, out, `"schema": "app"`)
++	assertContains(t, out, `"name": "app_marker"`)
++
++	// explicit qualifier is authoritative
++	out = callTool(t, c, "describe_table", map[string]any{"table": "public.orders"})
++	assertContains(t, out, `"schema": "public"`)
++	assertContains(t, out, `"name": "pub_marker"`)
++
++	// one off-path holder still resolves, flagged with a qualification note
++	out = callTool(t, c, "describe_table", map[string]any{"table": "lone"})
++	assertContains(t, out, `"schema": "archive"`)
++	assertContains(t, out, "not on the snapshot's search_path")
++
++	// nothing on or off the path: stable diagnostic naming the path
++	out = callTool(t, c, "describe_table", map[string]any{"table": "ghost"})
++	assertContains(t, out, "table 'ghost' not found (searched schemas: app, public)")
++}
++
++// Two servers over two snapshots (different profiles/databases) never share
++// resolution state: each bare name resolves against its own snapshot.
++func TestResolveTable_ResolutionStateIsPerSnapshot(t *testing.T) {
++	appFirst := finish(&schema.SchemaSnapshot{
++		SearchPath: []string{"app", "public"},
++		Tables:     []schema.Table{testTable("app", "orders"), testTable("public", "orders")},
++	})
++	publicFirst := finish(&schema.SchemaSnapshot{
++		SearchPath: []string{"public", "app"},
++		Tables:     []schema.Table{testTable("app", "orders"), testTable("public", "orders")},
++	})
++	s1 := serveOffline(t, NewOfflineServerAnnotated(annotate(appFirst, 1000), lint.DefaultConfig()))
++	s2 := serveOffline(t, NewOfflineServerAnnotated(annotate(publicFirst, 1000), lint.DefaultConfig()))
++
++	assertContains(t, callTool(t, s1, "describe_table", map[string]any{"table": "orders"}), `"schema": "app"`)
++	assertContains(t, callTool(t, s2, "describe_table", map[string]any{"table": "orders"}), `"schema": "public"`)
++}
++
+ // Resolution needs the snapshot, so it must run after the loaded check; moving
+ // it earlier would dereference nil instead of reporting the real problem.
+ func TestResolveTable_UninitializedReportsTheRealProblem(t *testing.T) {
+diff --git a/internal/mcp/tools.go b/internal/mcp/tools.go
+index 6373e96..bdb12c4 100644
+--- a/internal/mcp/tools.go
++++ b/internal/mcp/tools.go
+@@ -116,7 +116,7 @@ func (s *Server) registerSchemaTools(srv *mcpserver.MCPServer) {
+ 		mcp.NewTool("describe_table",
+ 			mcp.WithDescription("Before writing SQL against a table you have not read in this session, before a JOIN, or before a DELETE that might cascade: one table in full -- its columns and types, constraints, indexes, and planner stats. Needs no database connection; answers from the snapshot, and points at detect when the table has findings. detail=relations gives the incoming and outgoing foreign keys, each with a JOIN clause you can paste and the ON DELETE / ON UPDATE action it carries (declared constraints only, one hop, so a table reached by a cascade may cascade further). detail=stats adds vacuum: dead tuples, trigger points, effective autovacuum knobs and last vacuum/analyze times, for any table over 10k rows whether or not detect flagged it. Ask for the ddl field to get the CREATE TABLE that would rebuild it, with whatever the snapshot cannot reproduce listed beside it. Structure as of the last capture: no row data, and nothing a later migration changed."),
+ 			mcp.WithString("table", mcp.Required(), mcp.Description("Table name, bare or schema-qualified.")),
+-			mcp.WithString("schema", mcp.Description("Schema name. Without it a bare name resolves in public, or in the one schema that holds it.")),
++			mcp.WithString("schema", mcp.Description("Schema name. Without it a bare name resolves along the snapshot's captured search_path (older snapshots: public), or in the one schema that holds it.")),
+ 			mcp.WithString("detail",
+ 				mcp.Enum("summary", "full", "stats", "relations"),
+ 				mcp.DefaultString("summary"),
+diff --git a/internal/query/advise.go b/internal/query/advise.go
+index b2feead..6b2d395 100644
+--- a/internal/query/advise.go
++++ b/internal/query/advise.go
+@@ -24,7 +24,8 @@ type Advice struct {
+ func Advise(plan *PlanNode, a *schema.AnnotatedSchema) []Advice {
+ 	var advice []Advice
+ 	snap := a.Schema
+-	walkForAdvice(plan, a, &advice)
++	resolver := schema.NewResolver(snap)
++	walkForAdvice(plan, a, resolver, &advice)
+ 
+ 	if suggestions, err := SuggestIndex("", snap, plan); err == nil && len(suggestions) > 0 {
+ 		for i := range advice {
+@@ -79,38 +80,34 @@ func perNodeBreakdown(a *schema.AnnotatedSchema, qualified string) string {
+ 	return strings.Join(lines, "\n")
+ }
+ 
+-func walkForAdvice(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) {
+-	adviseSeqScan(node, a, advice)
+-	adviseNestedLoopSeqScan(node, advice)
+-	adviseSort(node, a.Schema, advice)
+-	adviseIndexScanBloat(node, a, advice)
++func walkForAdvice(node *PlanNode, a *schema.AnnotatedSchema, resolver *schema.Resolver, advice *[]Advice) {
++	adviseSeqScan(node, a, resolver, advice)
++	adviseNestedLoopSeqScan(node, resolver, advice)
++	adviseSort(node, resolver, advice)
++	adviseIndexScanBloat(node, a, resolver, advice)
+ 	adviseCTE(node, advice)
+ 
+ 	for i := range node.Children {
+-		walkForAdvice(&node.Children[i], a, advice)
++		walkForAdvice(&node.Children[i], a, resolver, advice)
+ 	}
+ }
+ 
+-func adviseSeqScan(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) {
++func adviseSeqScan(node *PlanNode, a *schema.AnnotatedSchema, resolver *schema.Resolver, advice *[]Advice) {
+ 	if node.NodeType != "Seq Scan" || node.RelationName == nil || node.PlanRows < 10_000 {
+ 		return
+ 	}
+ 
+ 	tableName := *node.RelationName
+-	schemaName := "public"
++	// a live plan always carries the schema the planner used; pasted plans
++	// without one resolve along the captured search_path, so sizing and stats
++	// below never come from a same-named table in another schema
++	explicit := ""
+ 	if node.Schema != nil {
+-		schemaName = *node.Schema
++		explicit = *node.Schema
+ 	}
++	table, qual, _ := resolver.ResolveTable(explicit, tableName)
++	schemaName := qual.Schema
+ 	qualified := schemaName + "." + tableName
+-	qual := schema.QualifiedName{Schema: schemaName, Name: tableName}
+-
+-	var table *schema.Table
+-	for i := range a.Schema.Tables {
+-		if a.Schema.Tables[i].Name == tableName && a.Schema.Tables[i].Schema == schemaName {
+-			table = &a.Schema.Tables[i]
+-			break
+-		}
+-	}
+ 
+ 	filterCol := extractColumnFromFilter(node.Filter)
+ 
+@@ -206,7 +203,7 @@ func adviseSeqScan(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice)
+ 	})
+ }
+ 
+-func adviseNestedLoopSeqScan(node *PlanNode, advice *[]Advice) {
++func adviseNestedLoopSeqScan(node *PlanNode, resolver *schema.Resolver, advice *[]Advice) {
+ 	if node.NodeType != "Nested Loop" || len(node.Children) < 2 {
+ 		return
+ 	}
+@@ -219,10 +216,12 @@ func adviseNestedLoopSeqScan(node *PlanNode, advice *[]Advice) {
+ 	if inner.RelationName != nil {
+ 		tableName = *inner.RelationName
+ 	}
+-	schemaName := "public"
++	explicit := ""
+ 	if inner.Schema != nil {
+-		schemaName = *inner.Schema
++		explicit = *inner.Schema
+ 	}
++	_, qual, _ := resolver.ResolveTable(explicit, tableName)
++	schemaName := qual.Schema
+ 	qualified := schemaName + "." + tableName
+ 
+ 	filterCol := extractColumnFromFilter(inner.Filter)
+@@ -242,7 +241,7 @@ func adviseNestedLoopSeqScan(node *PlanNode, advice *[]Advice) {
+ 	})
+ }
+ 
+-func adviseSort(node *PlanNode, _ *schema.SchemaSnapshot, advice *[]Advice) {
++func adviseSort(node *PlanNode, _ *schema.Resolver, advice *[]Advice) {
+ 	if node.NodeType != "Sort" || node.PlanRows < 10_000 || len(node.SortKey) == 0 {
+ 		return
+ 	}
+@@ -320,7 +319,7 @@ func versionNoteForIndex() *string {
+ 		"Use INCLUDE for covering indexes to enable index-only scans.")
+ }
+ 
+-func adviseIndexScanBloat(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) {
++func adviseIndexScanBloat(node *PlanNode, a *schema.AnnotatedSchema, resolver *schema.Resolver, advice *[]Advice) {
+ 	if node.IndexName == nil {
+ 		return
+ 	}
+@@ -329,28 +328,21 @@ func adviseIndexScanBloat(node *PlanNode, a *schema.AnnotatedSchema, advice *[]A
+ 	}
+ 
+ 	tableName := ""
+-	schemaName := "public"
+ 	if node.RelationName != nil {
+ 		tableName = *node.RelationName
+ 	}
+-	if node.Schema != nil {
+-		schemaName = *node.Schema
+-	}
+ 	if tableName == "" {
+ 		return
+ 	}
+-	qual := schema.QualifiedName{Schema: schemaName, Name: tableName}
+-
+-	var table *schema.Table
+-	for i := range a.Schema.Tables {
+-		if a.Schema.Tables[i].Name == tableName && a.Schema.Tables[i].Schema == schemaName {
+-			table = &a.Schema.Tables[i]
+-			break
+-		}
++	explicit := ""
++	if node.Schema != nil {
++		explicit = *node.Schema
+ 	}
+-	if table == nil {
++	table, qual, ok := resolver.ResolveTable(explicit, tableName)
++	if !ok {
+ 		return
+ 	}
++	schemaName := qual.Schema
+ 
+ 	indexName := *node.IndexName
+ 	for _, idx := range table.Indexes {
+diff --git a/internal/query/antipatterns.go b/internal/query/antipatterns.go
+index d9eecaa..722d381 100644
+--- a/internal/query/antipatterns.go
++++ b/internal/query/antipatterns.go
+@@ -7,13 +7,13 @@ import (
+ 	"github.com/boringsql/dryrun/internal/schema"
+ )
+ 
+-func detectAntipatterns(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
++func detectAntipatterns(parsed *ParsedQuery, resolver *schema.Resolver, warnings *[]ValidationWarning) {
+ 	detectSelectStar(parsed, warnings)
+-	detectUnboundedQuery(parsed, snap, warnings)
++	detectUnboundedQuery(parsed, warnings)
+ 	detectCartesianJoin(parsed, warnings)
+ 	detectDMLWithoutWhere(parsed, warnings)
+-	detectPartitionKeyAntipatterns(parsed, snap, warnings)
+-	detectPartitionKeyUpdate(parsed, snap, warnings)
++	detectPartitionKeyAntipatterns(parsed, resolver, warnings)
++	detectPartitionKeyUpdate(parsed, resolver, warnings)
+ 	detectUnvalidatedProceduralBody(parsed, warnings)
+ }
+ 
+@@ -42,23 +42,15 @@ func detectSelectStar(parsed *ParsedQuery, warnings *[]ValidationWarning) {
+ 	}
+ }
+ 
+-func detectUnboundedQuery(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
++func detectUnboundedQuery(parsed *ParsedQuery, warnings *[]ValidationWarning) {
++	// table-size refinement requires AnnotatedSchema; ValidateQuery doesn't
++	// carry one, so this detector is currently a placeholder
+ 	if parsed.Info.StatementType != "SELECT" {
+ 		return
+ 	}
+ 	if parsed.Info.HasWhere || parsed.Info.HasLimit {
+ 		return
+ 	}
+-
+-	for _, ref := range parsed.Info.Tables {
+-		schemaName := "public"
+-		if ref.Schema != nil {
+-			schemaName = *ref.Schema
+-		}
+-		// table-size refinement requires AnnotatedSchema; ValidateQuery doesn't carry one
+-		_ = schemaName
+-		_ = ref
+-	}
+ }
+ 
+ func detectCartesianJoin(parsed *ParsedQuery, warnings *[]ValidationWarning) {
+@@ -147,102 +139,89 @@ func detectDMLWithoutWhere(parsed *ParsedQuery, warnings *[]ValidationWarning) {
+ 	}
+ }
+ 
+-func detectPartitionKeyAntipatterns(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
++func detectPartitionKeyAntipatterns(parsed *ParsedQuery, resolver *schema.Resolver, warnings *[]ValidationWarning) {
+ 	for _, ref := range parsed.Info.Tables {
+-		schemaName := "public"
+-		if ref.Schema != nil {
+-			schemaName = *ref.Schema
++		t, _, ok := resolveRefTable(resolver, ref)
++		if !ok || t.PartitionInfo == nil {
++			continue
+ 		}
+ 
+-		for i := range snap.Tables {
+-			t := &snap.Tables[i]
+-			if t.Name != ref.Name || t.Schema != schemaName {
+-				continue
+-			}
+-			if t.PartitionInfo == nil {
+-				break
+-			}
+-
+-			keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
+-			found := false
++		keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
++		found := false
+ 
+-			for _, kc := range keyColumns {
+-				for _, fc := range parsed.Info.FilterColumns {
+-					if strings.EqualFold(fc.Column, kc) {
+-						found = true
+-						break
+-					}
+-				}
+-				if found {
++		for _, kc := range keyColumns {
++			for _, fc := range parsed.Info.FilterColumns {
++				if strings.EqualFold(fc.Column, kc) {
++					found = true
+ 					break
+ 				}
+ 			}
+-
+-			if !found {
+-				*warnings = append(*warnings, ValidationWarning{
+-					Severity: SeverityWarning,
+-					Message: fmt.Sprintf(
+-						"query on partitioned table '%s.%s' (%s on '%s', %d partitions) "+
+-							"does not filter on partition key; all partitions will be scanned",
+-						t.Schema, t.Name, t.PartitionInfo.Strategy, t.PartitionInfo.Key,
+-						len(t.PartitionInfo.Children)),
+-				})
++			if found {
++				break
+ 			}
++		}
++
++		if !found {
++			*warnings = append(*warnings, ValidationWarning{
++				Severity: SeverityWarning,
++				Message: fmt.Sprintf(
++					"query on partitioned table '%s.%s' (%s on '%s', %d partitions) "+
++						"does not filter on partition key; all partitions will be scanned",
++					t.Schema, t.Name, t.PartitionInfo.Strategy, t.PartitionInfo.Key,
++					len(t.PartitionInfo.Children)),
++			})
++		}
+ 
+-			for _, kc := range keyColumns {
+-				for _, fwc := range parsed.Info.FuncWrappedColumns {
+-					if strings.EqualFold(fwc.Column, kc) {
+-						*warnings = append(*warnings, ValidationWarning{
+-							Severity: SeverityWarning,
+-							Message: fmt.Sprintf(
+-								"partition key '%s' on '%s.%s' is wrapped in %s - this prevents partition pruning. %s",
+-								kc, t.Schema, t.Name, fwc.FuncName, funcWrapRewriteHint(fwc.FuncName, kc)),
+-						})
+-					}
++		for _, kc := range keyColumns {
++			for _, fwc := range parsed.Info.FuncWrappedColumns {
++				if strings.EqualFold(fwc.Column, kc) {
++					*warnings = append(*warnings, ValidationWarning{
++						Severity: SeverityWarning,
++						Message: fmt.Sprintf(
++							"partition key '%s' on '%s.%s' is wrapped in %s - this prevents partition pruning. %s",
++							kc, t.Schema, t.Name, fwc.FuncName, funcWrapRewriteHint(fwc.FuncName, kc)),
++					})
+ 				}
+ 			}
+-			break
+ 		}
+ 	}
+ }
+ 
+-func detectPartitionKeyUpdate(parsed *ParsedQuery, snap *schema.SchemaSnapshot, warnings *[]ValidationWarning) {
++func detectPartitionKeyUpdate(parsed *ParsedQuery, resolver *schema.Resolver, warnings *[]ValidationWarning) {
+ 	if parsed.Info.StatementType != "UPDATE" || len(parsed.Info.UpdateTargets) == 0 {
+ 		return
+ 	}
+ 
+ 	for _, ref := range parsed.Info.Tables {
+-		schemaName := "public"
+-		if ref.Schema != nil {
+-			schemaName = *ref.Schema
++		t, _, ok := resolveRefTable(resolver, ref)
++		if !ok || t.PartitionInfo == nil {
++			continue
+ 		}
+ 
+-		for i := range snap.Tables {
+-			t := &snap.Tables[i]
+-			if t.Name != ref.Name || t.Schema != schemaName {
+-				continue
+-			}
+-			if t.PartitionInfo == nil {
+-				break
+-			}
+-
+-			keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
+-			for _, kc := range keyColumns {
+-				for _, ut := range parsed.Info.UpdateTargets {
+-					if strings.EqualFold(ut, kc) {
+-						*warnings = append(*warnings, ValidationWarning{
+-							Severity: SeverityWarning,
+-							Message: fmt.Sprintf(
+-								"UPDATE changes partition key '%s' on partitioned table '%s.%s'. This causes cross-partition row movement (DELETE + INSERT)", kc, t.Schema, t.Name),
+-						})
+-					}
++		keyColumns := parsePartitionKeyColumns(t.PartitionInfo.Key)
++		for _, kc := range keyColumns {
++			for _, ut := range parsed.Info.UpdateTargets {
++				if strings.EqualFold(ut, kc) {
++					*warnings = append(*warnings, ValidationWarning{
++						Severity: SeverityWarning,
++						Message: fmt.Sprintf(
++							"UPDATE changes partition key '%s' on partitioned table '%s.%s'. This causes cross-partition row movement (DELETE + INSERT)", kc, t.Schema, t.Name),
++					})
+ 				}
+ 			}
+-			break
+ 		}
+ 	}
+ }
+ 
++// resolveRefTable applies the shared search_path rule to a parsed reference.
++func resolveRefTable(resolver *schema.Resolver, ref ReferencedTable) (*schema.Table, schema.QualifiedName, bool) {
++	explicit := ""
++	if ref.Schema != nil {
++		explicit = *ref.Schema
++	}
++	return resolver.ResolveTable(explicit, ref.Name)
++}
++
+ func funcWrapRewriteHint(funcName, col string) string {
+ 	switch funcName {
+ 	case "extract", "::date", "to_char":
+diff --git a/internal/query/explain.go b/internal/query/explain.go
+index 800c3f9..990cfb0 100644
+--- a/internal/query/explain.go
++++ b/internal/query/explain.go
+@@ -21,8 +21,11 @@ type (
+ 		StatsInjected *schema.InjectResult `json:"stats_injected,omitempty"`
+ 		GucsReplayed  []string             `json:"gucs_replayed,omitempty"`
+ 		GucsSkipped   []SkippedGuc         `json:"gucs_skipped,omitempty"`
+-		PgMustardTips []pgmustard.Tip      `json:"pgmustard_tips,omitempty"`
+-		RawPlanJSON   json.RawMessage      `json:"-"`
++		// search_path applied with SET LOCAL before EXPLAIN, rendered as the
++		// captured effective order; absent when no snapshot supplied it
++		SearchPathReplayed string        `json:"search_path_replayed,omitempty"`
++		PgMustardTips      []pgmustard.Tip `json:"pgmustard_tips,omitempty"`
++		RawPlanJSON        json.RawMessage `json:"-"`
+ 	}
+ 
+ 	PlanWarning struct {
+@@ -48,19 +51,33 @@ func ExplainQuery(ctx context.Context, pool *pgxpool.Pool, sql string, analyze b
+ 	}
+ 
+ 	replayGUCs := snap != nil && len(snap.GUCs) > 0
++	// replay the name-resolution context too: unqualified names in the
++	// statement must resolve to the same relations the offline analysis used,
++	// not to whatever the live role's default search_path would pick
++	searchPath := ""
++	if snap != nil {
++		searchPath = schema.SearchPathSetting(snap)
++	}
+ 
+ 	var (
+ 		jsonStr  string
+ 		replayed []string
+ 		skipped  []SkippedGuc
+ 	)
+-	if analyze || replayGUCs {
++	if analyze || replayGUCs || searchPath != "" {
+ 		tx, err := pool.Begin(ctx)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("begin transaction: %w", err)
+ 		}
+ 		defer tx.Rollback(ctx)
+ 
++		if searchPath != "" {
++			// SET LOCAL inside the rolled-back tx; a schema that vanished
++			// after capture is skipped by Postgres, not an error
++			if _, err := tx.Exec(ctx, "SELECT set_config('search_path', $1, true)", searchPath); err != nil {
++				return nil, fmt.Errorf("replay search_path: %w", err)
++			}
++		}
+ 		if replayGUCs {
+ 			replayed, skipped, err = applyPlannerGUCs(ctx, tx, snap.GUCs)
+ 			if err != nil {
+@@ -119,13 +136,14 @@ func ExplainQuery(ctx context.Context, pool *pgxpool.Pool, sql string, analyze b
+ 	warnings := DetectPlanWarnings(plan, snap)
+ 
+ 	return &ExplainResult{
+-		Plan:          *plan,
+-		TotalCost:     plan.TotalCost,
+-		EstimatedRows: plan.PlanRows,
+-		Warnings:      warnings,
+-		Execution:     execution,
+-		GucsReplayed:  replayed,
+-		GucsSkipped:   skipped,
+-		RawPlanJSON:   planArray[0],
++		Plan:               *plan,
++		TotalCost:          plan.TotalCost,
++		EstimatedRows:      plan.PlanRows,
++		Warnings:           warnings,
++		Execution:          execution,
++		GucsReplayed:       replayed,
++		GucsSkipped:        skipped,
++		SearchPathReplayed: searchPath,
++		RawPlanJSON:        planArray[0],
+ 	}, nil
+ }
+diff --git a/internal/query/explain_search_path_test.go b/internal/query/explain_search_path_test.go
+new file mode 100644
+index 0000000..24a3b54
+--- /dev/null
++++ b/internal/query/explain_search_path_test.go
+@@ -0,0 +1,58 @@
++package query
++
++import (
++	"context"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++
++	"github.com/boringsql/dryrun/internal/schema"
++)
++
++// Live: the EXPLAIN transaction must SET LOCAL search_path to the captured
++// order, so a bare table that only exists off the live role's default path
++// resolves exactly the way offline analysis resolved it.
++func TestExplainQuery_ReplaysCapturedSearchPath(t *testing.T) {
++	url := os.Getenv("TEST_DATABASE_URL")
++	if url == "" {
++		t.Skip("TEST_DATABASE_URL not set; skipping live explain test")
++	}
++	ctx := context.Background()
++	pool, err := pgxpool.New(ctx, url)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer pool.Close()
++
++	sp := "qpath_explain_test"
++	cleanup := func() {
++		_, _ = pool.Exec(ctx, "DROP SCHEMA IF EXISTS "+sp+" CASCADE")
++	}
++	cleanup()
++	if _, err := pool.Exec(ctx, "CREATE SCHEMA "+sp); err != nil {
++		t.Skipf("cannot create schema: %v", err)
++	}
++	t.Cleanup(cleanup)
++	if _, err := pool.Exec(ctx, "CREATE TABLE "+sp+".sp_only (id integer)"); err != nil {
++		t.Fatal(err)
++	}
++
++	// captured path puts the schema first; the live role's default does not
++	snap := &schema.SchemaSnapshot{SearchPath: []string{sp, "public"}}
++	res, err := ExplainQuery(ctx, pool, "SELECT * FROM sp_only", false, snap)
++	if err != nil {
++		t.Fatalf("EXPLAIN with replayed search_path failed: %v", err)
++	}
++	if !strings.Contains(res.SearchPathReplayed, sp) {
++		t.Errorf("search_path_replayed = %q, want it to name %s", res.SearchPathReplayed, sp)
++	}
++
++	// a pre-feature bundle (no path) replays public, and a table that only
++	// exists off public must then fail -- the two surfaces agree
++	legacy := &schema.SchemaSnapshot{}
++	if _, err := ExplainQuery(ctx, pool, "SELECT * FROM sp_only", false, legacy); err == nil {
++		t.Error("legacy public-only replay must not resolve a table hidden in another schema")
++	}
++}
+diff --git a/internal/query/migration.go b/internal/query/migration.go
+index 0dc1bf9..51b993b 100644
+--- a/internal/query/migration.go
++++ b/internal/query/migration.go
+@@ -83,7 +83,7 @@ func CheckMigration(ddl string, a *schema.AnnotatedSchema) ([]MigrationCheck, er
+ 
+ 	var checks []MigrationCheck
+ 	names := newNameAllocator(a.Schema)
+-	cat := newFileCatalog()
++	cat := newFileCatalog(a.Schema)
+ 
+ 	// checks[from:] are the previous statement's, which ran with stmtTx
+ 	inTx, stmtTx, from, txFrom := false, false, 0, 0
+@@ -208,7 +208,7 @@ func CheckMigration(ddl string, a *schema.AnnotatedSchema) ([]MigrationCheck, er
+ 		case *pg_query.Node_DropStmt:
+ 			switch n.DropStmt.RemoveType {
+ 			case pg_query.ObjectType_OBJECT_TABLE:
+-				for _, key := range dropTableKeys(n.DropStmt) {
++				for _, key := range dropTableKeys(a.Schema, n.DropStmt) {
+ 					delete(cat.created, key)
+ 					delete(cat.empty, key)
+ 					delete(cat.partitioned, key)
+@@ -259,6 +259,7 @@ func CheckMigration(ddl string, a *schema.AnnotatedSchema) ([]MigrationCheck, er
+ // sized against a pre-existing table.
+ type (
+ 	fileCatalog struct {
++		snap        *schema.SchemaSnapshot                 // resolution context for bare names
+ 		created     map[string]bool                        // relKey of tables created in this file
+ 		empty       map[string]bool                        // relKey of tables created empty in this file
+ 		partitioned map[string]bool                        // relKey of partitioned parents created in this file
+@@ -268,8 +269,9 @@ type (
+ 	}
+ )
+ 
+-func newFileCatalog() *fileCatalog {
++func newFileCatalog(snap *schema.SchemaSnapshot) *fileCatalog {
+ 	return &fileCatalog{
++		snap:        snap,
+ 		created:     map[string]bool{},
+ 		empty:       map[string]bool{},
+ 		partitioned: map[string]bool{},
+@@ -283,7 +285,7 @@ func (c *fileCatalog) markCreated(rel *pg_query.RangeVar, partitioned, condition
+ 	if rel == nil {
+ 		return
+ 	}
+-	key := relKey(rel)
++	key := relKey(c.snap, rel)
+ 	c.created[key] = true
+ 	c.empty[key] = true
+ 	if partitioned {
+@@ -298,8 +300,8 @@ func (c *fileCatalog) invalidate(rel *pg_query.RangeVar) {
+ 	if rel == nil {
+ 		return
+ 	}
+-	delete(c.empty, relKey(rel))
+-	delete(c.conditional, relKey(rel))
++	delete(c.empty, relKey(c.snap, rel))
++	delete(c.conditional, relKey(c.snap, rel))
+ }
+ 
+ func (c *fileCatalog) invalidateAll() {
+@@ -308,27 +310,27 @@ func (c *fileCatalog) invalidateAll() {
+ }
+ 
+ func (c *fileCatalog) isEmpty(rel *pg_query.RangeVar) bool {
+-	return c != nil && rel != nil && c.empty[relKey(rel)]
++	return c != nil && rel != nil && c.empty[relKey(c.snap, rel)]
+ }
+ 
+ func (c *fileCatalog) isPartitioned(rel *pg_query.RangeVar) bool {
+-	return c != nil && rel != nil && c.partitioned[relKey(rel)]
++	return c != nil && rel != nil && c.partitioned[relKey(c.snap, rel)]
+ }
+ 
+ func (c *fileCatalog) isConditional(rel *pg_query.RangeVar) bool {
+-	return c != nil && rel != nil && c.conditional[relKey(rel)]
++	return c != nil && rel != nil && c.conditional[relKey(c.snap, rel)]
+ }
+ 
+ func (c *fileCatalog) hasCreated(rel *pg_query.RangeVar) bool {
+-	return c != nil && rel != nil && c.created[relKey(rel)]
++	return c != nil && rel != nil && c.created[relKey(c.snap, rel)]
+ }
+ 
+ func (c *fileCatalog) rekey(oldRel *pg_query.RangeVar, newName string) {
+ 	if oldRel == nil || newName == "" {
+ 		return
+ 	}
+-	schemaName := schemaOf(oldRel)
+-	oldKey := relKey(oldRel)
++	schemaName := schemaOf(c.snap, oldRel)
++	oldKey := relKey(c.snap, oldRel)
+ 	newKey := schemaName + "." + newName
+ 	if c.created[oldKey] {
+ 		delete(c.created, oldKey)
+@@ -371,8 +373,10 @@ func alterAttachesPartition(stmt *pg_query.AlterTableStmt) bool {
+ 	return false
+ }
+ 
+-// DROP TABLE's objects are [schema, name] string lists.
+-func dropTableKeys(drop *pg_query.DropStmt) []string {
++// DROP TABLE's objects are [schema, name] string lists. A bare name is
++// keyed through the same captured search_path the create was, so the DROP
++// clears the catalog entry the CREATE made.
++func dropTableKeys(snap *schema.SchemaSnapshot, drop *pg_query.DropStmt) []string {
+ 	var keys []string
+ 	for _, obj := range drop.GetObjects() {
+ 		list, ok := obj.GetNode().(*pg_query.Node_List)
+@@ -387,7 +391,7 @@ func dropTableKeys(drop *pg_query.DropStmt) []string {
+ 		}
+ 		switch len(parts) {
+ 		case 1:
+-			keys = append(keys, "public."+parts[0])
++			keys = append(keys, schemaOf(snap, &pg_query.RangeVar{Relname: parts[0]})+"."+parts[0])
+ 		case 2:
+ 			keys = append(keys, parts[0]+"."+parts[1])
+ 		}
+@@ -404,7 +408,7 @@ func analyzeAlterTableCmd(cmd *pg_query.AlterTableCmd, stmt *pg_query.AlterTable
+ 			tableName = stmt.Relation.Relname
+ 		}
+ 	}
+-	qual := schema.QualifiedName{Schema: schemaOf(stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
++	qual := schema.QualifiedName{Schema: schemaOf(a.Schema, stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
+ 	tableSize, rowEstimate, small, sizing := lookupTableStats(a, qual)
+ 	statement := alterCmdStatement(stmt, cmd)
+ 
+@@ -702,7 +706,7 @@ func createTableNoOp(rel *pg_query.RangeVar, a *schema.AnnotatedSchema, cat *fil
+ 	}
+ 	// Size from the snapshot only: a table this file created has no captured size.
+ 	if !cat.hasCreated(rel) {
+-		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()})
++		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()})
+ 		c.TableSize = size
+ 		c.RowEstimate = rows
+ 		if size == nil {
+@@ -725,7 +729,7 @@ func analyzeAnalyze(stmt *pg_query.VacuumStmt, a *schema.AnnotatedSchema, stmtNo
+ 	if rels := stmt.GetRels(); len(rels) > 0 {
+ 		if rv := rels[0].GetVacuumRelation().GetRelation(); rv != nil {
+ 			c.Table = strp(relationName(rv))
+-			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rv), Name: rv.GetRelname()})
++			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rv), Name: rv.GetRelname()})
+ 			c.TableSize, c.RowEstimate = size, rows
+ 		}
+ 	}
+@@ -744,7 +748,7 @@ func analyzeCreateStats(stmt *pg_query.CreateStatsStmt, a *schema.AnnotatedSchem
+ 	if rels := stmt.GetRelations(); len(rels) > 0 {
+ 		if rv := rels[0].GetRangeVar(); rv != nil {
+ 			c.Table = strp(relationName(rv))
+-			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rv), Name: rv.GetRelname()})
++			size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rv), Name: rv.GetRelname()})
+ 			c.TableSize, c.RowEstimate = size, rows
+ 		}
+ 	}
+@@ -1896,7 +1900,7 @@ func analyzeCreateIndex(idx *pg_query.IndexStmt, a *schema.AnnotatedSchema, name
+ 			tableName = idx.Relation.Relname
+ 		}
+ 	}
+-	qual := schema.QualifiedName{Schema: schemaOf(idx.GetRelation()), Name: idx.GetRelation().GetRelname()}
++	qual := schema.QualifiedName{Schema: schemaOf(a.Schema, idx.GetRelation()), Name: idx.GetRelation().GetRelname()}
+ 	tableSize, rowEstimate, small, sizing := lookupTableStats(a, qual)
+ 	// index method and columns for jit
+ 	idxMethod := "btree"
+@@ -2250,7 +2254,7 @@ func dropIndexCheck(drop *pg_query.DropStmt, stmtNode *pg_query.Node) MigrationC
+ // no-WHERE write on a table that is not known small is a caution.
+ func analyzeDML(operation string, rel *pg_query.RangeVar, bounded bool, a *schema.AnnotatedSchema, cat *fileCatalog, stmtNode *pg_query.Node) MigrationCheck {
+ 	tableName := relationName(rel)
+-	qual := schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()}
++	qual := schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()}
+ 	tableSize, rowEstimate, small, sizing := lookupTableStats(a, qual)
+ 	statement := topLevelStatement(stmtNode)
+ 
+@@ -2317,7 +2321,7 @@ func analyzeComment(stmt *pg_query.CommentStmt, a *schema.AnnotatedSchema, stmtN
+ 	}
+ 	if rel := commentRelation(stmt); rel != nil {
+ 		c.Table = strp(relationName(rel))
+-		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()})
++		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()})
+ 		c.TableSize = size
+ 		c.RowEstimate = rows
+ 	}
+@@ -2375,7 +2379,7 @@ func dropTriggerCheck(drop *pg_query.DropStmt, a *schema.AnnotatedSchema, stmtNo
+ 	}
+ 	if rel := dropTriggerRelation(drop); rel != nil {
+ 		c.Table = strp(relationName(rel))
+-		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(rel), Name: rel.GetRelname()})
++		size, rows, _, _ := lookupTableStats(a, schema.QualifiedName{Schema: schemaOf(a.Schema, rel), Name: rel.GetRelname()})
+ 		c.TableSize = size
+ 		c.RowEstimate = rows
+ 	}
+@@ -2491,7 +2495,7 @@ func analyzeReindex(stmt *pg_query.ReindexStmt, a *schema.AnnotatedSchema, cat *
+ 	if stmt.GetKind() == pg_query.ReindexObjectType_REINDEX_OBJECT_INDEX ||
+ 		stmt.GetKind() == pg_query.ReindexObjectType_REINDEX_OBJECT_TABLE {
+ 		hasSchema := stmt.GetRelation().GetSchemaname() != ""
+-		qual := schema.QualifiedName{Schema: schemaOf(stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
++		qual := schema.QualifiedName{Schema: schemaOf(a.Schema, stmt.GetRelation()), Name: stmt.GetRelation().GetRelname()}
+ 		if stmt.GetKind() == pg_query.ReindexObjectType_REINDEX_OBJECT_INDEX {
+ 			qual = tableOfIndex(a, qual, hasSchema)
+ 		} else {
+@@ -2521,16 +2525,36 @@ func analyzeReindex(stmt *pg_query.ReindexStmt, a *schema.AnnotatedSchema, cat *
+ 	return base
+ }
+ 
+-// tableOfIndex resolves REINDEX INDEX's parent table so it can be sized. Unless
+-// the statement qualified the schema, match the index name across schemas.
++// tableOfIndex resolves REINDEX INDEX's parent table so it can be sized. A
++// qualified schema is matched exactly; a bare index name resolves along the
++// captured search_path, so a same-named index in another schema can never be
++// sized in its place.
+ func tableOfIndex(a *schema.AnnotatedSchema, idx schema.QualifiedName, hasSchema bool) schema.QualifiedName {
+ 	if a == nil || a.Schema == nil {
+ 		return idx
+ 	}
+-	for _, t := range a.Schema.Tables {
+-		for _, i := range t.Indexes {
+-			if i.Name == idx.Name && (!hasSchema || idx.Schema == t.Schema) {
+-				return schema.QualifiedName{Schema: t.Schema, Name: t.Name}
++	if hasSchema {
++		for _, t := range a.Schema.Tables {
++			if t.Schema != idx.Schema {
++				continue
++			}
++			for _, i := range t.Indexes {
++				if i.Name == idx.Name {
++					return schema.QualifiedName{Schema: t.Schema, Name: t.Name}
++				}
++			}
++		}
++		return idx
++	}
++	for _, sch := range schema.EffectiveSearchPath(a.Schema) {
++		for _, t := range a.Schema.Tables {
++			if t.Schema != sch {
++				continue
++			}
++			for _, i := range t.Indexes {
++				if i.Name == idx.Name {
++					return schema.QualifiedName{Schema: t.Schema, Name: t.Name}
++				}
+ 			}
+ 		}
+ 	}
+diff --git a/internal/query/migration_maintenance.go b/internal/query/migration_maintenance.go
+index 07da07e..c90c38a 100644
+--- a/internal/query/migration_maintenance.go
++++ b/internal/query/migration_maintenance.go
+@@ -61,7 +61,7 @@ func rewriteMaintenance(operation, reason string, rels []*pg_query.RangeVar, a *
+ 	rec := reason
+ 	note := ""
+ 	if len(rels) == 1 {
+-		qual := schema.QualifiedName{Schema: schemaOf(rels[0]), Name: rels[0].GetRelname()}
++		qual := schema.QualifiedName{Schema: schemaOf(a.Schema, rels[0]), Name: rels[0].GetRelname()}
+ 		size, rows, small, sizing := lookupTableStats(a, qual)
+ 		check.Table = strp(relationName(rels[0]))
+ 		check.TableSize, check.RowEstimate = size, rows
+diff --git a/internal/query/migration_rewrite.go b/internal/query/migration_rewrite.go
+index 6ef2fad..074077f 100644
+--- a/internal/query/migration_rewrite.go
++++ b/internal/query/migration_rewrite.go
+@@ -46,7 +46,7 @@ func (a *nameAllocator) claim(bucket, base string) string {
+ 
+ // Constraint names are unique per table; the bucket is seeded from the snapshot.
+ func (a *nameAllocator) constraintBucket(rel *pg_query.RangeVar) string {
+-	bucket := "constraint:" + relKey(rel)
++	bucket := "constraint:" + relKey(a.snap, rel)
+ 	if _, ok := a.taken[bucket]; ok {
+ 		return bucket
+ 	}
+@@ -62,7 +62,7 @@ func (a *nameAllocator) constraintBucket(rel *pg_query.RangeVar) string {
+ 
+ // Index names are unique per schema, not per table.
+ func (a *nameAllocator) indexBucket(rel *pg_query.RangeVar) string {
+-	sch := schemaOf(rel)
++	sch := schemaOf(a.snap, rel)
+ 	bucket := "index:" + sch
+ 	if _, ok := a.taken[bucket]; ok {
+ 		return bucket
+@@ -438,28 +438,32 @@ func relationName(rel *pg_query.RangeVar) string {
+ 	return quoteIdent(rel.GetSchemaname()) + "." + quoteIdent(rel.GetRelname())
+ }
+ 
+-func schemaOf(rel *pg_query.RangeVar) string {
+-	if s := rel.GetSchemaname(); s != "" {
+-		return s
++// schemaOf names the schema a parsed RangeVar denotes under the snapshot's
++// captured search_path: an explicit qualifier always wins; a bare name
++// resolves to the first path schema holding the relation, or to the path's
++// creation target (legacy "public" on old bundles) for a table the snapshot
++// does not hold yet. Every sizing, naming and constraint lookup shares it,
++// so one statement can never read another schema's same-named object.
++func schemaOf(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar) string {
++	if rel == nil {
++		return schema.LegacyDefaultSchema
+ 	}
+-	return "public"
++	return schema.NewResolver(snap).ResolveSchemaName(rel.GetSchemaname(), rel.GetRelname())
+ }
+ 
+-func relKey(rel *pg_query.RangeVar) string {
+-	return schemaOf(rel) + "." + rel.GetRelname()
++func relKey(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar) string {
++	return schemaOf(snap, rel) + "." + rel.GetRelname()
+ }
+ 
+ func lookupTable(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar) *schema.Table {
+-	if snap == nil {
++	if snap == nil || rel == nil {
+ 		return nil
+ 	}
+-	key := relKey(rel)
+-	for i := range snap.Tables {
+-		if snap.Tables[i].Schema+"."+snap.Tables[i].Name == key {
+-			return &snap.Tables[i]
+-		}
++	t, _, ok := schema.NewResolver(snap).ResolveTable(rel.GetSchemaname(), rel.GetRelname())
++	if !ok {
++		return nil
+ 	}
+-	return nil
++	return t
+ }
+ 
+ // Postgres clips to whole characters; cutting mid-rune would break the name.
+diff --git a/internal/query/migration_validation.go b/internal/query/migration_validation.go
+index 6138c86..2021b2a 100644
+--- a/internal/query/migration_validation.go
++++ b/internal/query/migration_validation.go
+@@ -127,7 +127,7 @@ func constraintsFor(snap *schema.SchemaSnapshot, cat *fileCatalog, rel *pg_query
+ 		}
+ 	}
+ 	if cat != nil {
+-		for name, e := range cat.cons[relKey(rel)] {
++		for name, e := range cat.cons[relKey(snap, rel)] {
+ 			if e.gone {
+ 				delete(out, name)
+ 			} else {
+@@ -196,7 +196,7 @@ func containsString(list []string, s string) bool {
+ }
+ 
+ func (c *fileCatalog) entryFor(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar, name string) *constraintEntry {
+-	if e, ok := c.cons[relKey(rel)][name]; ok {
++	if e, ok := c.cons[relKey(snap, rel)][name]; ok {
+ 		return e
+ 	}
+ 	if t := lookupTable(snap, rel); t != nil {
+@@ -215,7 +215,7 @@ func (c *fileCatalog) observeAlter(snap *schema.SchemaSnapshot, stmt *pg_query.A
+ 	if c == nil || rel == nil {
+ 		return
+ 	}
+-	key := relKey(rel)
++	key := relKey(snap, rel)
+ 	set := func(e *constraintEntry) {
+ 		if c.cons[key] == nil {
+ 			c.cons[key] = map[string]*constraintEntry{}
+@@ -246,7 +246,7 @@ func (c *fileCatalog) renameConstraint(snap *schema.SchemaSnapshot, rel *pg_quer
+ 	if e == nil {
+ 		return
+ 	}
+-	key := relKey(rel)
++	key := relKey(snap, rel)
+ 	if c.cons[key] == nil {
+ 		c.cons[key] = map[string]*constraintEntry{}
+ 	}
+@@ -258,7 +258,7 @@ func (c *fileCatalog) renameConstraint(snap *schema.SchemaSnapshot, rel *pg_quer
+ 
+ // listed once per table per file, not per ALTER.
+ func (c *fileCatalog) unvalidatedNote(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar, except string) []string {
+-	if c == nil || rel == nil || c.reported[relKey(rel)] {
++	if c == nil || rel == nil || c.reported[relKey(snap, rel)] {
+ 		return nil
+ 	}
+ 	var names []string
+@@ -268,7 +268,7 @@ func (c *fileCatalog) unvalidatedNote(snap *schema.SchemaSnapshot, rel *pg_query
+ 		}
+ 	}
+ 	if len(names) > 0 {
+-		c.reported[relKey(rel)] = true
++		c.reported[relKey(snap, rel)] = true
+ 	}
+ 	return names
+ }
+diff --git a/internal/query/plan_warnings.go b/internal/query/plan_warnings.go
+index fa12cc4..8eea297 100644
+--- a/internal/query/plan_warnings.go
++++ b/internal/query/plan_warnings.go
+@@ -104,7 +104,11 @@ func detectPartitionPruningIssues(node *PlanNode, snap *schema.SchemaSnapshot, w
+ 		if child.RelationName == nil {
+ 			continue
+ 		}
+-		p, _ := findPartitionParent(*child.RelationName, snap)
++		childSchema := ""
++		if child.Schema != nil {
++			childSchema = *child.Schema
++		}
++		p, _ := findPartitionParent(childSchema, *child.RelationName, snap)
+ 		if p == nil {
+ 			continue
+ 		}
+@@ -161,7 +165,11 @@ func detectCTEMaterialized(node *PlanNode, snap *schema.SchemaSnapshot, warnings
+ 		if (child.NodeType == "Append" || child.NodeType == "Merge Append") && snap != nil {
+ 			for j := range child.Children {
+ 				if child.Children[j].RelationName != nil {
+-					if p, _ := findPartitionParent(*child.Children[j].RelationName, snap); p != nil {
++					childSchema := ""
++					if child.Children[j].Schema != nil {
++						childSchema = *child.Children[j].Schema
++					}
++					if p, _ := findPartitionParent(childSchema, *child.Children[j].RelationName, snap); p != nil {
+ 						qualified := p.Schema + "." + p.Name
+ 						e = jit.CTEOverPartitionedTable(cteName, qualified)
+ 						break
+@@ -178,19 +186,55 @@ func detectCTEMaterialized(node *PlanNode, snap *schema.SchemaSnapshot, warnings
+ 	})
+ }
+ 
+-func findPartitionParent(childTableName string, snap *schema.SchemaSnapshot) (*schema.Table, string) {
++// findPartitionParent matches a scanned partition child back to its parent.
++// A plan-provided schema is matched exactly; a bare name (pasted plan
++// without schema) picks the parent whose child sits earliest on the
++// captured search_path, never a same-named child from another schema.
++func findPartitionParent(childSchema, childTableName string, snap *schema.SchemaSnapshot) (*schema.Table, string) {
++	if snap == nil {
++		return nil, ""
++	}
++	if childSchema != "" {
++		for i := range snap.Tables {
++			t := &snap.Tables[i]
++			if t.PartitionInfo == nil {
++				continue
++			}
++			for _, child := range t.PartitionInfo.Children {
++				if child.Name == childTableName && child.Schema == childSchema {
++					return t, t.PartitionInfo.Key
++				}
++			}
++		}
++		return nil, ""
++	}
++
++	rank := map[string]int{}
++	for i, sch := range schema.EffectiveSearchPath(snap) {
++		rank[sch] = i
++	}
++	var best *schema.Table
++	var bestKey string
++	bestRank := int(^uint(0) >> 1)
+ 	for i := range snap.Tables {
+ 		t := &snap.Tables[i]
+ 		if t.PartitionInfo == nil {
+ 			continue
+ 		}
+ 		for _, child := range t.PartitionInfo.Children {
+-			if child.Name == childTableName {
+-				return t, t.PartitionInfo.Key
++			if child.Name != childTableName {
++				continue
++			}
++			r, ok := rank[child.Schema]
++			if !ok {
++				r = len(rank) // schemas off the path lose to on-path ones
++			}
++			if r < bestRank {
++				best, bestKey, bestRank = t, t.PartitionInfo.Key, r
+ 			}
+ 		}
+ 	}
+-	return nil, ""
++	return best, bestKey
+ }
+ 
+ func detectHighRowsRemoved(node *PlanNode, warnings *[]PlanWarning) {
+diff --git a/internal/query/search_path_test.go b/internal/query/search_path_test.go
+new file mode 100644
+index 0000000..bae2f7f
+--- /dev/null
++++ b/internal/query/search_path_test.go
+@@ -0,0 +1,353 @@
++package query
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/boringsql/dryrun/internal/schema"
++)
++
++// searchPathSnap: app.orders and public.orders are different tables; app is
++// first on the captured path. archive/off1/off2 sit off the path.
++func searchPathSnap() *schema.AnnotatedSchema {
++	s := &schema.SchemaSnapshot{
++		PgVersion:   "PostgreSQL 17.0",
++		Database:    "appdb",
++		Timestamp:   time.Now().UTC(),
++		ContentHash: "sp",
++		SearchPath:  []string{"app", "public"},
++		Tables: []schema.Table{
++			{
++				Schema: "app", Name: "orders",
++				Columns: []schema.Column{
++					{Name: "id", Ordinal: 1, TypeName: "bigint"},
++					{Name: "app_col", Ordinal: 2, TypeName: "text"},
++					{Name: "tenant_id", Ordinal: 3, TypeName: "bigint"},
++				},
++				Indexes: []schema.Index{
++					{Name: "orders_app_col_idx", Columns: []string{"app_col"}},
++				},
++			},
++			{
++				Schema: "public", Name: "orders",
++				Columns: []schema.Column{
++					{Name: "id", Ordinal: 1, TypeName: "bigint"},
++					{Name: "pub_col", Ordinal: 2, TypeName: "text"},
++				},
++			},
++			{
++				Schema: "app", Name: "events",
++				Columns: []schema.Column{
++					{Name: "id", TypeName: "bigint"},
++					{Name: "created_at", TypeName: "timestamptz"},
++				},
++				PartitionInfo: &schema.PartitionInfo{
++					Strategy: schema.PartitionRange,
++					Key:      "created_at",
++					Children: []schema.PartitionChild{
++						{Schema: "app", Name: "events_2026", Bound: "FOR VALUES FROM ('2026-01-01') TO ('2027-01-01')"},
++					},
++				},
++			},
++			{Schema: "archive", Name: "audit_log", Columns: []schema.Column{{Name: "id", TypeName: "bigint"}}},
++			{Schema: "off1", Name: "dup", Columns: []schema.Column{{Name: "id", TypeName: "bigint"}}},
++			{Schema: "off2", Name: "dup", Columns: []schema.Column{{Name: "id", TypeName: "bigint"}}},
++		},
++	}
++	return &schema.AnnotatedSchema{
++		Schema: s,
++		Planner: &schema.PlannerStatsSnapshot{
++			Timestamp: time.Now().UTC(),
++			Tables: []schema.TableSizingEntry{
++				{Table: schema.QualifiedName{Schema: "app", Name: "orders"}, Sizing: schema.TableSizing{Reltuples: 9_000_000, TableSize: 50 << 30}},
++				{Table: schema.QualifiedName{Schema: "public", Name: "orders"}, Sizing: schema.TableSizing{Reltuples: 10, TableSize: 8192}},
++			},
++		},
++	}
++}
++
++func TestSearchPath_ValidateBareNameResolvesFirstOnPath(t *testing.T) {
++	snap := searchPathSnap().Schema
++
++	// the app table's own column validates; the public table's does not
++	res, err := ValidateQuery("SELECT app_col FROM orders WHERE tenant_id = 1", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !res.Valid {
++		t.Errorf("expected valid against app.orders, got %v", res.Errors)
++	}
++
++	res, err = ValidateQuery("SELECT o.pub_col FROM orders o", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Valid {
++		t.Fatal("pub_col must not validate against app.orders")
++	}
++	found := false
++	for _, e := range res.Errors {
++		if strings.Contains(e, "column 'pub_col' does not exist on table 'app.orders'") {
++			found = true
++		}
++	}
++	if !found {
++		t.Errorf("error must name app.orders, not another schema's copy: %v", res.Errors)
++	}
++}
++
++func TestSearchPath_ExplicitQualifierBypassesPath(t *testing.T) {
++	snap := searchPathSnap().Schema
++	res, err := ValidateQuery("SELECT pub_col FROM public.orders WHERE id = 1", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !res.Valid {
++		t.Errorf("public.orders must validate with its own column, got %v", res.Errors)
++	}
++
++	// an explicit schema that lacks the table is a hard miss, not path fallback
++	res, err = ValidateQuery("SELECT id FROM tenant.orders", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, e := range res.Errors {
++		if strings.Contains(e, "table or view 'tenant.orders' does not exist") {
++			return
++		}
++	}
++	t.Errorf("expected explicit-miss message, got %v", res.Errors)
++}
++
++func TestSearchPath_SelectStarExpandsResolvedTable(t *testing.T) {
++	snap := searchPathSnap().Schema
++	res, err := ValidateQuery("SELECT * FROM orders", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(res.ResolvedStarColumns) != 1 {
++		t.Fatalf("want one star expansion, got %d", len(res.ResolvedStarColumns))
++	}
++	star := res.ResolvedStarColumns[0]
++	if star.Table != "app.orders" {
++		t.Errorf("star table = %q, want app.orders", star.Table)
++	}
++	wantCols := []string{"id", "app_col", "tenant_id"}
++	if strings.Join(star.Columns, ",") != strings.Join(wantCols, ",") {
++		t.Errorf("star columns = %v, want %v", star.Columns, wantCols)
++	}
++}
++
++func TestSearchPath_MissingDiagnosticIsStable(t *testing.T) {
++	snap := searchPathSnap().Schema
++	res, err := ValidateQuery("SELECT * FROM nowhere", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := "table or view 'nowhere' does not exist (searched schemas: app, public)"
++	for _, e := range res.Errors {
++		if e == want {
++			return
++		}
++	}
++	t.Errorf("want %q, got %v", want, res.Errors)
++}
++
++func TestSearchPath_CorrectionQualifiesUniqueOffPathHolder(t *testing.T) {
++	snap := searchPathSnap().Schema
++	res, err := ValidateQuery("SELECT * FROM audit_log", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(res.CorrectedSQL, "archive.audit_log") {
++		t.Fatalf("want corrected_sql qualifying archive.audit_log, got %q", res.CorrectedSQL)
++	}
++	if len(res.Fixes) != 1 || res.Fixes[0].To != "archive.audit_log" {
++		t.Errorf("fixes = %+v", res.Fixes)
++	}
++
++	// same name in two off-path schemas: no mechanical rewrite
++	res, err = ValidateQuery("SELECT * FROM dup", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.CorrectedSQL != "" {
++		t.Errorf("an ambiguous off-path name must not be rewritten, got %q", res.CorrectedSQL)
++	}
++}
++
++func TestSearchPath_SuggestIndexesTargetsResolvedTable(t *testing.T) {
++	snap := searchPathSnap().Schema
++	// tenant_id has no index on either copy, so it survives the leading-index gate
++	suggestions, err := SuggestIndex("SELECT id FROM orders WHERE tenant_id = 1", snap, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(suggestions) != 1 {
++		t.Fatalf("want one suggestion, got %+v", suggestions)
++	}
++	s := suggestions[0]
++	if s.Table != "app.orders" {
++		t.Errorf("suggestion table = %q, want app.orders", s.Table)
++	}
++	if !strings.Contains(s.DDL, "ON app.orders") {
++		t.Errorf("DDL must target app.orders: %s", s.DDL)
++	}
++}
++
++func TestSearchPath_PlanSuggestionWithBarePlanSchema(t *testing.T) {
++	snap := searchPathSnap().Schema
++	plan := &PlanNode{
++		NodeType:     "Seq Scan",
++		RelationName: strp("orders"),
++		PlanRows:     50_000,
++		Filter:       strp("(tenant_id = 1)"),
++	}
++	suggestions, err := SuggestIndex("", snap, plan)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(suggestions) != 1 || suggestions[0].Table != "app.orders" {
++		t.Fatalf("want one app.orders suggestion, got %+v", suggestions)
++	}
++}
++
++func TestSearchPath_PartitionAntipatternNamesAppTable(t *testing.T) {
++	snap := searchPathSnap().Schema
++	res, err := ValidateQuery("SELECT id FROM events WHERE id = 1", snap)
++	if err != nil {
++		t.Fatal(err)
++	}
++	found := false
++	for _, w := range res.Warnings {
++		if strings.Contains(w.Message, "partitioned table 'app.events'") {
++			found = true
++		}
++	}
++	if !found {
++		t.Errorf("want app.events partition warning, got %v", res.Warnings)
++	}
++}
++
++func TestSearchPath_MigrationSizesResolvedTable(t *testing.T) {
++	a := searchPathSnap()
++
++	// bare DDL sizes the 9M-row app table, not the 10-row public one
++	checks, err := CheckMigration("ALTER TABLE orders ALTER COLUMN id TYPE text", a)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c := checks[0]
++	if c.Safety != SafetyDangerous {
++		t.Errorf("app.orders is large, want dangerous, got %q", c.Safety)
++	}
++	if c.RowEstimate == nil || *c.RowEstimate < 1_000_000 {
++		t.Errorf("row estimate = %v, want ~9M from app.orders sizing", c.RowEstimate)
++	}
++
++	// explicit public picks the small copy and softens to caution
++	checks, err = CheckMigration("ALTER TABLE public.orders ALTER COLUMN id TYPE text", a)
++	if err != nil {
++		t.Fatal(err)
++	}
++	c = checks[0]
++	if c.Safety != SafetyCaution {
++		t.Errorf("public.orders is small, want caution, got %q", c.Safety)
++	}
++	if c.RowEstimate == nil || *c.RowEstimate > 100 {
++		t.Errorf("row estimate = %v, want 10 from public.orders sizing", c.RowEstimate)
++	}
++}
++
++func TestSearchPath_MigrationFileCatalogKeysFollowPath(t *testing.T) {
++	a := searchPathSnap()
++	ddl := "CREATE TABLE made_it (id bigint);\nALTER TABLE made_it ADD COLUMN note text;"
++	checks, err := CheckMigration(ddl, a)
++	if err != nil {
++		t.Fatal(err)
++	}
++	last := checks[len(checks)-1]
++	// the ADD COLUMN only reports 0 bytes when its catalog lookup keyed the
++	// bare name to the same schema the CREATE did
++	if last.TableSize == nil || *last.TableSize != "0 bytes" {
++		t.Errorf("file-created table must size as empty, got %v (keys mismatched across statements)", last.TableSize)
++	}
++}
++
++func TestSearchPath_SaferSQLIndexNameDisambiguatesInResolvedSchema(t *testing.T) {
++	a := searchPathSnap()
++	// app.orders already holds orders_app_col_idx; the generated concurrent
++	// name must collide there and take the _1 suffix, never reuse or jump
++	// schemas
++	checks, err := CheckMigration("CREATE INDEX ON orders (app_col)", a)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// the rewrite keeps the bare table name (its resolution is replayed the
++	// same way), but the generated name is disambiguated inside app's index
++	// namespace, where orders_app_col_idx is already taken
++	found := false
++	for _, c := range checks {
++		for _, s := range c.SaferSQL {
++			if strings.Contains(s, "orders_app_col_idx1") && strings.Contains(s, "ON orders") {
++				found = true
++			}
++		}
++	}
++	if !found {
++		t.Errorf("want safer_sql with orders_app_col_idx1 disambiguated in app, got %+v", checks[0].SaferSQL)
++	}
++}
++
++func TestSearchPath_LegacyBundleResolvesPublic(t *testing.T) {
++	a := searchPathSnap()
++	a.Schema.SearchPath = nil // an old history.db row or remote bundle
++
++	res, err := ValidateQuery("SELECT pub_col FROM orders", a.Schema)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !res.Valid {
++		t.Errorf("legacy path must resolve bare orders as public, got %v", res.Errors)
++	}
++
++	res, err = ValidateQuery("SELECT o.app_col FROM orders o", a.Schema)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if res.Valid {
++		t.Error("app_col must not resolve on the public copy")
++	}
++
++	// legacy missing message keeps the public-qualified shape
++	res, err = ValidateQuery("SELECT * FROM nope", a.Schema)
++	if err != nil {
++		t.Fatal(err)
++	}
++	found := false
++	for _, e := range res.Errors {
++		if strings.Contains(e, "table or view 'public.nope' does not exist") {
++			found = true
++		}
++	}
++	if !found {
++		t.Errorf("legacy miss must name public.nope, got %v", res.Errors)
++	}
++}
++
++func TestSearchPath_ResolversDoNotLeakAcrossSnapshots(t *testing.T) {
++	one := searchPathSnap().Schema
++	two := searchPathSnap().Schema
++	two.SearchPath = []string{"public", "app"}
++
++	r1, r2 := schema.NewResolver(one), schema.NewResolver(two)
++	t1, q1, _ := r1.ResolveTable("", "orders")
++	t2, q2, _ := r2.ResolveTable("", "orders")
++	if q1.Schema != "app" || q2.Schema != "public" {
++		t.Fatalf("resolution leaked across snapshots: %s vs %s", q1.Schema, q2.Schema)
++	}
++	if t1.Columns[1].Name != "app_col" || t2.Columns[1].Name != "pub_col" {
++		t.Fatalf("columns came from the wrong snapshot: %v %v", t1.Columns, t2.Columns)
++	}
++}
+diff --git a/internal/query/suggest.go b/internal/query/suggest.go
+index f9d4ffa..215790e 100644
+--- a/internal/query/suggest.go
++++ b/internal/query/suggest.go
+@@ -26,30 +26,28 @@ func SuggestIndex(sql string, snap *schema.SchemaSnapshot, plan *PlanNode) ([]In
+ 
+ 	var suggestions []IndexSuggestion
+ 
++	resolver := schema.NewResolver(snap)
+ 	if plan != nil {
+-		suggestFromPlan(plan, snap, &suggestions)
++		suggestFromPlan(plan, resolver, &suggestions)
+ 	}
+-	suggestFromQueryStructure(parsed, snap, &suggestions)
++	suggestFromQueryStructure(parsed, resolver, &suggestions)
+ 	dedupSuggestions(&suggestions)
+ 
+ 	return suggestions, nil
+ }
+ 
+-func suggestFromPlan(node *PlanNode, snap *schema.SchemaSnapshot, suggestions *[]IndexSuggestion) {
++func suggestFromPlan(node *PlanNode, resolver *schema.Resolver, suggestions *[]IndexSuggestion) {
+ 	if node.NodeType == "Seq Scan" && node.PlanRows >= 1000 && node.RelationName != nil {
+ 		tableName := *node.RelationName
+-		schemaName := "public"
++		// EXPLAIN output always names the schema; pasted plans without one
++		// resolve along the captured search_path
++		explicit := ""
+ 		if node.Schema != nil {
+-			schemaName = *node.Schema
++			explicit = *node.Schema
+ 		}
+ 
+-		var table *schema.Table
+-		for i := range snap.Tables {
+-			if snap.Tables[i].Name == tableName && snap.Tables[i].Schema == schemaName {
+-				table = &snap.Tables[i]
+-				break
+-			}
+-		}
++		table, q, _ := resolver.ResolveTable(explicit, tableName)
++		schemaName := q.Schema
+ 
+ 		if node.Filter != nil {
+ 			col := extractSuggestFilterColumn(*node.Filter)
+@@ -93,11 +91,11 @@ func suggestFromPlan(node *PlanNode, snap *schema.SchemaSnapshot, suggestions *[
+ 	}
+ 
+ 	for i := range node.Children {
+-		suggestFromPlan(&node.Children[i], snap, suggestions)
++		suggestFromPlan(&node.Children[i], resolver, suggestions)
+ 	}
+ }
+ 
+-func suggestFromQueryStructure(parsed *ParsedQuery, snap *schema.SchemaSnapshot, suggestions *[]IndexSuggestion) {
++func suggestFromQueryStructure(parsed *ParsedQuery, resolver *schema.Resolver, suggestions *[]IndexSuggestion) {
+ 	for _, fc := range parsed.Info.FilterColumns {
+ 		var ref *ReferencedTable
+ 		if fc.Table != nil {
+@@ -116,19 +114,8 @@ func suggestFromQueryStructure(parsed *ParsedQuery, snap *schema.SchemaSnapshot,
+ 			continue
+ 		}
+ 
+-		schemaName := "public"
+-		if ref.Schema != nil {
+-			schemaName = *ref.Schema
+-		}
+-
+-		var table *schema.Table
+-		for i := range snap.Tables {
+-			if snap.Tables[i].Name == ref.Name && snap.Tables[i].Schema == schemaName {
+-				table = &snap.Tables[i]
+-				break
+-			}
+-		}
+-		if table == nil {
++		table, _, ok := resolveRefTable(resolver, *ref)
++		if !ok {
+ 			continue
+ 		}
+ 
+diff --git a/internal/query/validate.go b/internal/query/validate.go
+index 9c8b7d1..428128d 100644
+--- a/internal/query/validate.go
++++ b/internal/query/validate.go
+@@ -3,6 +3,7 @@ package query
+ import (
+ 	"fmt"
+ 	"slices"
++	"strings"
+ 
+ 	"github.com/boringsql/dryrun/internal/schema"
+ )
+@@ -97,66 +98,53 @@ func validate(sql string, snap *schema.SchemaSnapshot) (*ValidationResult, fixPl
+ 		resolvedStar []ResolvedStar
+ 	)
+ 
++	// one resolver for the whole pass: every step reads the same object for
++	// the same name, along the snapshot's captured search_path
++	resolver := schema.NewResolver(snap)
++
+ 	// check each referenced table exists
+ 	for _, ref := range parsed.Info.Tables {
+ 		if ref.Schema == nil && slices.Contains(parsed.Info.cteNames, ref.Name) {
+ 			continue
+ 		}
+-		tableName := ref.Name
+-		schemaName := "public"
++		explicit := ""
+ 		if ref.Schema != nil {
+-			schemaName = *ref.Schema
+-		}
+-
+-		found := false
+-		for _, t := range snap.Tables {
+-			if t.Name == tableName && t.Schema == schemaName {
+-				found = true
+-				break
+-			}
++			explicit = *ref.Schema
+ 		}
+-		if !found {
+-			isView := false
+-			for _, v := range snap.Views {
+-				if v.Name == tableName && v.Schema == schemaName {
+-					isView = true
+-					break
+-				}
+-			}
+-			if !isView {
+-				errors = append(errors, fmt.Sprintf(
+-					"table or view '%s.%s' does not exist", schemaName, tableName))
+-				plan.add(tableFix(snap, schemaName, ref))
+-			}
++		if _, _, ok := resolver.LookupRelation(explicit, ref.Name); !ok {
++			errors = append(errors, missingRelationMessage(ref, resolver))
++			plan.add(tableFix(resolver, ref))
+ 		}
+ 	}
+ 
+-	validateReferencedColumns(parsed, snap, &errors, &plan)
++	validateReferencedColumns(parsed, resolver, &errors, &plan)
+ 
+ 	// resolve SELECT *
+ 	if parsed.Info.HasSelectStar {
+ 		for _, ref := range parsed.Info.Tables {
+-			schemaName := "public"
++			if ref.Schema == nil && slices.Contains(parsed.Info.cteNames, ref.Name) {
++				continue
++			}
++			explicit := ""
+ 			if ref.Schema != nil {
+-				schemaName = *ref.Schema
++				explicit = *ref.Schema
+ 			}
+-			for _, t := range snap.Tables {
+-				if t.Name == ref.Name && t.Schema == schemaName {
+-					cols := make([]string, len(t.Columns))
+-					for i, c := range t.Columns {
+-						cols[i] = c.Name
+-					}
+-					resolvedStar = append(resolvedStar, ResolvedStar{
+-						Table:   t.Schema + "." + t.Name,
+-						Columns: cols,
+-					})
+-					break
+-				}
++			t, _, ok := resolver.ResolveTable(explicit, ref.Name)
++			if !ok {
++				continue
+ 			}
++			cols := make([]string, len(t.Columns))
++			for i, c := range t.Columns {
++				cols[i] = c.Name
++			}
++			resolvedStar = append(resolvedStar, ResolvedStar{
++				Table:   t.Schema + "." + t.Name,
++				Columns: cols,
++			})
+ 		}
+ 	}
+ 
+-	detectAntipatterns(parsed, snap, &warnings)
++	detectAntipatterns(parsed, resolver, &warnings)
+ 
+ 	return &ValidationResult{
+ 		Valid:               len(errors) == 0,
+@@ -167,7 +155,7 @@ func validate(sql string, snap *schema.SchemaSnapshot) (*ValidationResult, fixPl
+ 	}, plan, nil
+ }
+ 
+-func validateReferencedColumns(parsed *ParsedQuery, snap *schema.SchemaSnapshot, errors *[]string, plan *fixPlan) {
++func validateReferencedColumns(parsed *ParsedQuery, resolver *schema.Resolver, errors *[]string, plan *fixPlan) {
+ 	for _, fc := range parsed.Info.ReferencedColumns {
+ 		if fc.Table == nil {
+ 			continue
+@@ -187,34 +175,51 @@ func validateReferencedColumns(parsed *ParsedQuery, snap *schema.SchemaSnapshot,
+ 			continue
+ 		}
+ 
+-		schemaName := "public"
++		explicit := ""
+ 		if ref.Schema != nil {
+-			schemaName = *ref.Schema
++			explicit = *ref.Schema
+ 		}
+-		for _, t := range snap.Tables {
+-			if t.Name == ref.Name && t.Schema == schemaName {
+-				found := false
+-				for _, c := range t.Columns {
+-					if c.Name == fc.Column {
+-						found = true
+-						break
+-					}
+-				}
+-				if !found {
+-					*errors = append(*errors, fmt.Sprintf(
+-						"column '%s' does not exist on table '%s.%s'",
+-						fc.Column, t.Schema, t.Name))
+-					plan.add(columnFix(&t, alias, fc))
+-				}
++		t, _, ok := resolver.ResolveTable(explicit, ref.Name)
++		if !ok {
++			// the missing table already has its own error and fix; do not
++			// pile column errors or pick another schema's columns
++			continue
++		}
++		found := false
++		for _, c := range t.Columns {
++			if c.Name == fc.Column {
++				found = true
+ 				break
+ 			}
+ 		}
++		if !found {
++			*errors = append(*errors, fmt.Sprintf(
++				"column '%s' does not exist on table '%s.%s'",
++				fc.Column, t.Schema, t.Name))
++			plan.add(columnFix(t, alias, fc))
++		}
+ 	}
+ }
+ 
+-// An unqualified name that exists in exactly one other schema is a missing
+-// qualifier, not a typo; that outranks any distance guess.
+-func tableFix(snap *schema.SchemaSnapshot, schemaName string, ref ReferencedTable) *pendingFix {
++// missingRelationMessage is the one stable diagnostic for an unresolvable
++// reference. An explicit qualifier names it verbatim; an unqualified name on
++// a multi-schema path also names the schemas Postgres walked, in order, so
++// the same query always yields the same message.
++func missingRelationMessage(ref ReferencedTable, resolver *schema.Resolver) string {
++	if ref.Schema != nil {
++		return fmt.Sprintf("table or view '%s.%s' does not exist", *ref.Schema, ref.Name)
++	}
++	path := resolver.Path()
++	if len(path) == 1 && path[0] == schema.LegacyDefaultSchema {
++		return fmt.Sprintf("table or view '%s.%s' does not exist", schema.LegacyDefaultSchema, ref.Name)
++	}
++	return fmt.Sprintf("table or view '%s' does not exist (searched schemas: %s)",
++		ref.Name, strings.Join(path, ", "))
++}
++
++// An unqualified name that exists in exactly one schema off the search_path
++// is a missing qualifier, not a typo; that outranks any distance guess.
++func tableFix(resolver *schema.Resolver, ref ReferencedTable) *pendingFix {
+ 	written := ref.Name
+ 	if ref.Schema != nil {
+ 		written = *ref.Schema + "." + ref.Name
+@@ -228,34 +233,45 @@ func tableFix(snap *schema.SchemaSnapshot, schemaName string, ref ReferencedTabl
+ 	}
+ 
+ 	if ref.Schema == nil {
+-		var elsewhere []string
+-		for _, r := range relations(snap) {
+-			if r.name == ref.Name && r.schema != schemaName {
+-				elsewhere = append(elsewhere, r.schema)
+-			}
++		// the name failed resolution along the path, so every holder is
++		// necessarily off it; one holder qualifies unambiguously
++		holders := resolver.AllNamedRelations(ref.Name)
++		if len(holders) == 1 {
++			return mk(holders[0].Schema + "." + ref.Name)
+ 		}
+-		if len(elsewhere) == 1 {
+-			return mk(elsewhere[0] + "." + ref.Name)
+-		}
+-		if len(elsewhere) > 1 {
++		if len(holders) > 1 {
+ 			return nil
+ 		}
+-	}
+ 
+-	var pool []string
+-	for _, r := range relations(snap) {
+-		if r.schema == schemaName {
+-			pool = append(pool, r.name)
++		// typo candidates stay unqualified: the pool is every bare name
++		// reachable along the path, so a bare replacement resolves exactly
++		// as intended
++		var pool []string
++		seen := map[string]bool{}
++		for _, sch := range resolver.Path() {
++			for _, q := range resolver.AllNamedRelationsInSchema(sch) {
++				if !seen[q.Name] {
++					seen[q.Name] = true
++					pool = append(pool, q.Name)
++				}
++			}
++		}
++		if cand, ok := bestCandidate(ref.Name, pool); ok {
++			return mk(cand)
+ 		}
+-	}
+-	cand, ok := bestCandidate(ref.Name, pool)
+-	if !ok {
+ 		return nil
+ 	}
+-	if ref.Schema != nil {
++
++	// explicit qualifier: candidates come from the named schema only, and
++	// the qualifier is preserved
++	var pool []string
++	for _, q := range resolver.AllNamedRelationsInSchema(*ref.Schema) {
++		pool = append(pool, q.Name)
++	}
++	if cand, ok := bestCandidate(ref.Name, pool); ok {
+ 		return mk(*ref.Schema + "." + cand)
+ 	}
+-	return mk(cand)
++	return nil
+ }
+ 
+ func columnFix(t *schema.Table, alias string, fc FilterColumn) *pendingFix {
+@@ -276,16 +292,3 @@ func columnFix(t *schema.Table, alias string, fc FilterColumn) *pendingFix {
+ 		expect:   []string{alias + "." + fc.Column},
+ 	}
+ }
+-
+-type relation struct{ schema, name string }
+-
+-func relations(snap *schema.SchemaSnapshot) []relation {
+-	out := make([]relation, 0, len(snap.Tables)+len(snap.Views))
+-	for _, t := range snap.Tables {
+-		out = append(out, relation{t.Schema, t.Name})
+-	}
+-	for _, v := range snap.Views {
+-		out = append(out, relation{v.Schema, v.Name})
+-	}
+-	return out
+-}
+diff --git a/internal/schema/introspect.go b/internal/schema/introspect.go
+index 1295bdf..bee3fe7 100644
+--- a/internal/schema/introspect.go
++++ b/internal/schema/introspect.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"log/slog"
+ 	"sort"
++	"strings"
+ 	"time"
+ 
+ 	"github.com/boringsql/queries"
+@@ -148,6 +149,9 @@ func IntrospectSchema(ctx context.Context, pool Querier) (*SchemaSnapshot, error
+ 	if err != nil {
+ 		return nil, fmt.Errorf("fetch gucs: %w", err)
+ 	}
++	// Resolution context, not DDL: a read failure degrades to the legacy
++	// public-only rule, it must not lose the whole schema capture.
++	searchPath := fetchSearchPath(ctx, pool)
+ 
+ 	flavor := detectFlavor(ctx, pool, extensions)
+ 
+@@ -179,6 +183,7 @@ func IntrospectSchema(ctx context.Context, pool Querier) (*SchemaSnapshot, error
+ 		Functions:     functions,
+ 		Extensions:    extensions,
+ 		GUCs:          gucs,
++		SearchPath:    searchPath,
+ 	}
+ 	snap.ContentHash = DigestFor(snap)
+ 	return snap, nil
+@@ -656,6 +661,38 @@ func fetchGUCs(ctx context.Context, pool Querier) ([]GucSetting, error) {
+ 	})
+ }
+ 
++// fetchSearchPath resolves the role's effective search_path to existing
++// schemas in search order. Best-effort: any read error or an unreadable row
++// is logged and left empty, so consumers fall back to legacy ["public"]
++// rather than losing the capture. Repeats collapse to first occurrence.
++func fetchSearchPath(ctx context.Context, pool Querier) []string {
++	rows, err := query(ctx, pool, "fetch-search-path")
++	if err != nil {
++		slog.Warn("fetch search_path failed, resolving unqualified names as public", "err", err)
++		return nil
++	}
++	names, err := scanAll(rows, func(r pgx.Rows) (string, error) {
++		var name string
++		err := r.Scan(&name)
++		return name, err
++	})
++	if err != nil {
++		slog.Warn("scan search_path failed, resolving unqualified names as public", "err", err)
++		return nil
++	}
++	out := make([]string, 0, len(names))
++	seen := make(map[string]bool, len(names))
++	for _, name := range names {
++		name = strings.TrimSpace(name)
++		if name == "" || seen[name] {
++			continue
++		}
++		seen[name] = true
++		out = append(out, name)
++	}
++	return out
++}
++
+ // Assembly: merge parts into Table structs
+ 
+ type colKey struct {
+diff --git a/internal/schema/search_path_test.go b/internal/schema/search_path_test.go
+new file mode 100644
+index 0000000..d49a5fa
+--- /dev/null
++++ b/internal/schema/search_path_test.go
+@@ -0,0 +1,86 @@
++package schema
++
++import (
++	"context"
++	"os"
++	"strings"
++	"testing"
++
++	"github.com/jackc/pgx/v5/pgxpool"
++)
++
++// A capturing role with a non-default search_path must have that effective
++// path recorded, in order, with $user expanded and missing entries dropped.
++func TestIntrospect_CapturesEffectiveSearchPath(t *testing.T) {
++	admin := livePool(t)
++	ctx := context.Background()
++
++	// throwaway names; test databases grant CREATE on the database to the
++	// login role used by the other live tests
++	spSchema := "dryrun_sp_test_schema"
++	if _, err := admin.Exec(ctx, "DROP SCHEMA IF EXISTS "+spSchema+" CASCADE"); err != nil {
++		t.Skipf("cannot set up live search_path test: %v", err)
++	}
++	if _, err := admin.Exec(ctx, "CREATE SCHEMA "+spSchema); err != nil {
++		t.Skipf("cannot create schema: %v", err)
++	}
++	t.Cleanup(func() { _, _ = admin.Exec(context.Background(), "DROP SCHEMA IF EXISTS "+spSchema+" CASCADE") })
++
++	cfg, err := pgxpool.ParseConfig(os.Getenv("TEST_DATABASE_URL"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	// existing, "$user" (no role-named schema here -> dropped), and a
++	// non-existent entry that Postgres silently skips at resolution
++	cfg.ConnConfig.RuntimeParams["search_path"] = spSchema + ", pg_catalog, \"$user\", no_such_schema_xyz, public"
++	pool, err := pgxpool.NewWithConfig(ctx, cfg)
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer pool.Close()
++
++	snap, err := IntrospectSchema(ctx, pool)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// assert order and filters without assuming the role has no own schema:
++	// the custom schema leads, pg_catalog follows, the dead entry is gone,
++	// and public survives last
++	path := snap.SearchPath
++	if len(path) < 3 || path[0] != spSchema || path[1] != "pg_catalog" || path[len(path)-1] != "public" {
++		t.Errorf("captured search_path = %v, want %s first, pg_catalog next, public last", path, spSchema)
++	}
++	for _, s := range path {
++		if s == "no_such_schema_xyz" {
++			t.Errorf("non-existent schema must be dropped, got %v", path)
++		}
++	}
++	// the captured path must be replayable as a SET LOCAL value
++	if setting := SearchPathSetting(snap); !strings.Contains(setting, spSchema) ||
++		!strings.Contains(setting, `"public"`) || strings.Contains(strings.ToLower(setting), "no_such_schema_xyz") {
++		t.Errorf("replay setting = %q", setting)
++	}
++
++	// and it must actually steer name resolution in a live session
++	var resolved string
++	if err := pool.QueryRow(ctx, "SELECT current_schema").Scan(&resolved); err != nil {
++		t.Fatal(err)
++	}
++	if resolved != spSchema {
++		t.Errorf("current_schema = %q, want %q", resolved, spSchema)
++	}
++}
++
++// Without a configured path, the capture still records at least one schema
++// for the role (the default "$user", public resolves somewhere).
++func TestIntrospect_SearchPathNeverEmptyOnLive(t *testing.T) {
++	pool := livePool(t)
++	snap, err := IntrospectSchema(context.Background(), pool)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(snap.SearchPath) == 0 {
++		t.Fatal("a live role always resolves at least one schema; capture came back empty")
++	}
++}
+diff --git a/internal/schema/snapshot.go b/internal/schema/snapshot.go
+index b8e073a..f5af325 100644
+--- a/internal/schema/snapshot.go
++++ b/internal/schema/snapshot.go
+@@ -56,6 +56,8 @@ type (
+ 	AnnotatedSchema          = snapshot.AnnotatedSchema
+ 	MergedActivity           = snapshot.MergedActivity
+ 	NodeActivity             = snapshot.NodeActivity
++	Resolver                 = snapshot.Resolver
++	RelationKind             = snapshot.RelationKind
+ )
+ 
+ // Enum values.
+@@ -80,6 +82,12 @@ const (
+ 	FlavorPostgres       = snapshot.FlavorPostgres
+ 	FlavorAlloyDBOmni    = snapshot.FlavorAlloyDBOmni
+ 	FlavorAlloyDBManaged = snapshot.FlavorAlloyDBManaged
++
++	RelNone  = snapshot.RelNone
++	RelTable = snapshot.RelTable
++	RelView  = snapshot.RelView
++
++	LegacyDefaultSchema = snapshot.LegacyDefaultSchema
+ )
+ 
+ // Functions.
+@@ -100,4 +108,8 @@ var (
+ 	ComputePlannerContentHash    = snapshot.ComputePlannerContentHash
+ 	ComputeActivityContentHash   = snapshot.ComputeActivityContentHash
+ 	ComputeQueryStatsContentHash = snapshot.ComputeQueryStatsContentHash
++
++	NewResolver           = snapshot.NewResolver
++	EffectiveSearchPath   = snapshot.EffectiveSearchPath
++	SearchPathSetting     = snapshot.SearchPathSetting
+ )
+diff --git a/internal/schema/sql/introspect.sql b/internal/schema/sql/introspect.sql
+index 986632e..e4b0471 100644
+--- a/internal/schema/sql/introspect.sql
++++ b/internal/schema/sql/introspect.sql
+@@ -313,6 +313,36 @@ SELECT e.extname   AS ext_name,
+   JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+  ORDER BY e.extname
+ 
++-- Effective, replayable search_path for the capturing role: "$user" is
++-- expanded to the role name (and dropped when no such schema/role exists),
++-- the "" empty-schema marker and names that do not resolve to a namespace
++-- are dropped, and search order is preserved. Only schemas present in
++-- pg_namespace survive, which is exactly the list Postgres walks.
++-- name: fetch-search-path
++WITH parts(ord, token) AS (
++    SELECT u.ord, btrim(u.token)
++      FROM (SELECT pg_catalog.current_setting('search_path') AS setting) AS raw,
++           unnest(string_to_array(raw.setting, ',')) WITH ORDINALITY AS u(token, ord)
++),
++expanded(ord, nspname) AS (
++    SELECT parts.ord,
++           CASE
++               WHEN lower(parts.token) IN ('$user', '"$user"')
++                   THEN (SELECT r.rolname
++                           FROM pg_catalog.pg_roles r
++                          WHERE r.rolname = current_user)
++               WHEN parts.token = '""' THEN NULL
++               ELSE btrim(parts.token, '"')
++           END
++      FROM parts
++)
++SELECT e.nspname
++  FROM expanded e
++ WHERE e.nspname IS NOT NULL
++   AND e.nspname <> ''
++   AND EXISTS (SELECT 1 FROM pg_catalog.pg_namespace n WHERE n.nspname = e.nspname)
++ ORDER BY e.ord
++
+ -- name: fetch-gucs
+ SELECT name, setting, unit
+   FROM pg_catalog.pg_settings
+diff --git a/pkg/snapshot/resolve.go b/pkg/snapshot/resolve.go
+new file mode 100644
+index 0000000..d3dc02d
+--- /dev/null
++++ b/pkg/snapshot/resolve.go
+@@ -0,0 +1,282 @@
++package snapshot
++
++import (
++	"sort"
++	"strings"
++)
++
++// LegacyDefaultSchema is what every name resolved against before snapshots
++// carried an effective search_path. Old history.db rows and remote bundles
++// without one keep this behavior.
++const LegacyDefaultSchema = "public"
++
++// EffectiveSearchPath is the replayable schema order names resolve along:
++// trimmed, de-duplicated entries from the captured list. A nil snapshot, an
++// empty list, or a list holding only empty/unreadable entries resolves the
++// legacy way as ["public"]. Explicit schema qualifiers never consult this.
++func EffectiveSearchPath(s *SchemaSnapshot) []string {
++	if s == nil || len(s.SearchPath) == 0 {
++		return []string{LegacyDefaultSchema}
++	}
++	out := make([]string, 0, len(s.SearchPath))
++	seen := make(map[string]bool, len(s.SearchPath))
++	for _, raw := range s.SearchPath {
++		name := strings.TrimSpace(raw)
++		// an empty or unreadable entry is skipped, exactly as Postgres
++		// skips a schema it cannot find on the path
++		if name == "" || seen[name] {
++			continue
++		}
++		seen[name] = true
++		out = append(out, name)
++	}
++	if len(out) == 0 {
++		return []string{LegacyDefaultSchema}
++	}
++	return out
++}
++
++// quoteSettingIdent renders one schema name for SET LOCAL search_path.
++// Quoting every entry is always legal; doubling embedded quotes keeps the
++// value injection-safe.
++func quoteSettingIdent(s string) string {
++	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
++}
++
++// SearchPathSetting renders the effective path as a SET LOCAL value that
++// replays the same resolution order in a live session:
++//
++//	"app", "tenant", public
++//
++// Every entry is quoted, so mixed-case or punctuation-bearing names survive
++// the round trip, and a schema missing from the live catalog is skipped by
++// Postgres rather than erroring.
++func SearchPathSetting(s *SchemaSnapshot) string {
++	path := EffectiveSearchPath(s)
++	parts := make([]string, len(path))
++	for i, sch := range path {
++		parts[i] = quoteSettingIdent(sch)
++	}
++	return strings.Join(parts, ", ")
++}
++
++type RelationKind uint8
++
++const (
++	RelNone RelationKind = iota
++	RelTable
++	RelView
++)
++
++// Resolver applies the single relation-resolution rule every analysis entry
++// point shares: an explicit schema qualifier is authoritative and never
++// falls back; an unqualified name picks the first match along the snapshot's
++// effective search_path, so same-named objects in different schemas resolve
++// to exactly one table/view, its own columns, constraints and statistics.
++//
++// A Resolver is built per use from one snapshot; holding no package-level
++// state, two snapshots (different profiles or databases) can never leak
++// resolution state into each other.
++type Resolver struct {
++	snap *SchemaSnapshot
++	path []string
++
++	tables map[QualifiedName]*Table
++	views  map[QualifiedName]*View
++
++	// first object holding a bare name along path order
++	bareTable map[string]*Table
++	bareView  map[string]*View
++	bareRel   map[string]resolvedRel
++}
++
++type resolvedRel struct {
++	kind  RelationKind
++	q     QualifiedName
++	table *Table
++	view  *View
++}
++
++// NewResolver indexes one snapshot. A nil snapshot resolves as legacy
++// ["public"] against no objects, which yields stable missing results rather
++// than panicking.
++func NewResolver(s *SchemaSnapshot) *Resolver {
++	r := &Resolver{
++		snap:      s,
++		path:      EffectiveSearchPath(s),
++		tables:    make(map[QualifiedName]*Table),
++		views:     make(map[QualifiedName]*View),
++		bareTable: make(map[string]*Table),
++		bareView:  make(map[string]*View),
++		bareRel:   make(map[string]resolvedRel),
++	}
++	if s == nil {
++		return r
++	}
++	for i := range s.Tables {
++		t := &s.Tables[i]
++		r.tables[QualifiedName{Schema: t.Schema, Name: t.Name}] = t
++	}
++	for i := range s.Views {
++		v := &s.Views[i]
++		r.views[QualifiedName{Schema: v.Schema, Name: v.Name}] = v
++	}
++	// path order is the outer loop so an object in an earlier schema always
++	// shadows a same-named one in a later schema
++	for _, sch := range r.path {
++		for i := range s.Tables {
++			t := &s.Tables[i]
++			if t.Schema != sch {
++				continue
++			}
++			if _, ok := r.bareRel[t.Name]; !ok {
++				q := QualifiedName{Schema: t.Schema, Name: t.Name}
++				r.bareRel[t.Name] = resolvedRel{kind: RelTable, q: q, table: t}
++				r.bareTable[t.Name] = t
++			}
++		}
++		for i := range s.Views {
++			v := &s.Views[i]
++			if v.Schema != sch {
++				continue
++			}
++			if _, ok := r.bareRel[v.Name]; !ok {
++				q := QualifiedName{Schema: v.Schema, Name: v.Name}
++				r.bareRel[v.Name] = resolvedRel{kind: RelView, q: q, view: v}
++				r.bareView[v.Name] = v
++			}
++		}
++	}
++	return r
++}
++
++// Path returns a copy of the effective schema order, earliest first.
++func (r *Resolver) Path() []string {
++	return append([]string(nil), r.path...)
++}
++
++// Snapshot returns the snapshot this resolver was built for.
++func (r *Resolver) Snapshot() *SchemaSnapshot { return r.snap }
++
++// ResolveTable finds the table an explicit ("schema.name") or unqualified
++// ("name") reference denotes. An explicit schema is matched exactly and
++// never falls through to search_path. The returned QualifiedName is the
++// unique identity columns, constraints, indexes and stats must be read with.
++func (r *Resolver) ResolveTable(explicitSchema, name string) (*Table, QualifiedName, bool) {
++	if explicitSchema != "" {
++		t := r.tables[QualifiedName{Schema: explicitSchema, Name: name}]
++		if t == nil {
++			return nil, QualifiedName{Schema: explicitSchema, Name: name}, false
++		}
++		return t, t.Qual(), true
++	}
++	t := r.bareTable[name]
++	if t == nil {
++		return nil, QualifiedName{Schema: r.TargetSchema(), Name: name}, false
++	}
++	return t, t.Qual(), true
++}
++
++// ResolveView is ResolveTable for views and materialized views.
++func (r *Resolver) ResolveView(explicitSchema, name string) (*View, QualifiedName, bool) {
++	if explicitSchema != "" {
++		v := r.views[QualifiedName{Schema: explicitSchema, Name: name}]
++		if v == nil {
++			return nil, QualifiedName{Schema: explicitSchema, Name: name}, false
++		}
++		return v, QualifiedName{Schema: v.Schema, Name: v.Name}, true
++	}
++	v := r.bareView[name]
++	if v == nil {
++		return nil, QualifiedName{Schema: r.TargetSchema(), Name: name}, false
++	}
++	return v, QualifiedName{Schema: v.Schema, Name: v.Name}, true
++}
++
++// LookupRelation resolves a table-or-view reference under one rule,
++// reporting which kind was found. Views and tables share a namespace in
++// Postgres, so within a schema the name can only denote one of them.
++func (r *Resolver) LookupRelation(explicitSchema, name string) (RelationKind, QualifiedName, bool) {
++	if explicitSchema != "" {
++		q := QualifiedName{Schema: explicitSchema, Name: name}
++		if t := r.tables[q]; t != nil {
++			return RelTable, t.Qual(), true
++		}
++		if v := r.views[q]; v != nil {
++			return RelView, QualifiedName{Schema: v.Schema, Name: v.Name}, true
++		}
++		return RelNone, q, false
++	}
++	if rel, ok := r.bareRel[name]; ok {
++		return rel.kind, rel.q, true
++	}
++	return RelNone, QualifiedName{Schema: r.TargetSchema(), Name: name}, false
++}
++
++// TargetSchema is where an unqualified CREATE puts a new object: the first
++// creatable entry of the path. The captured list already excludes empty and
++// non-existent schemas.
++func (r *Resolver) TargetSchema() string {
++	if len(r.path) > 0 {
++		return r.path[0]
++	}
++	return LegacyDefaultSchema
++}
++
++// ResolveSchemaName says which schema a parsed RangeVar denotes. An explicit
++// qualifier always wins, even when nothing is in it yet. An unqualified name
++// on an existing object resolves to that object's schema (first on the
++// path); on a name the snapshot does not hold it denotes the creation
++// target, which is also the legacy default "public" for old bundles.
++func (r *Resolver) ResolveSchemaName(explicitSchema, name string) string {
++	if explicitSchema != "" {
++		return explicitSchema
++	}
++	if rel, ok := r.bareRel[name]; ok {
++		return rel.q.Schema
++	}
++	return r.TargetSchema()
++}
++
++// AllNamedRelations returns every table/view holding the bare name,
++// qualified, sorted by schema then name. It backs "the name exists in
++// several schemas" diagnostics for callers that take unqualified input
++// outside of SQL text (e.g. the describe_table tool).
++func (r *Resolver) AllNamedRelations(name string) []QualifiedName {
++	var out []QualifiedName
++	for q := range r.tables {
++		if q.Name == name {
++			out = append(out, q)
++		}
++	}
++	for q := range r.views {
++		if q.Name == name {
++			out = append(out, q)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool {
++		if out[i].Schema != out[j].Schema {
++			return out[i].Schema < out[j].Schema
++		}
++		return out[i].Name < out[j].Name
++	})
++	return out
++}
++
++// AllNamedRelationsInSchema lists every table/view in one schema, sorted by
++// name. Used to build the typo-candidate pool reachable from one path entry.
++func (r *Resolver) AllNamedRelationsInSchema(sch string) []QualifiedName {
++	var out []QualifiedName
++	for q := range r.tables {
++		if q.Schema == sch {
++			out = append(out, q)
++		}
++	}
++	for q := range r.views {
++		if q.Schema == sch {
++			out = append(out, q)
++		}
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
++	return out
++}
+diff --git a/pkg/snapshot/resolve_test.go b/pkg/snapshot/resolve_test.go
+new file mode 100644
+index 0000000..1498a0b
+--- /dev/null
++++ b/pkg/snapshot/resolve_test.go
+@@ -0,0 +1,196 @@
++package snapshot
++
++import (
++	"reflect"
++	"testing"
++)
++
++func searchPathSnap() *SchemaSnapshot {
++	return &SchemaSnapshot{
++		SearchPath: []string{"app", "tenant", "public"},
++		Tables: []Table{
++			{Schema: "app", Name: "orders", Columns: []Column{{Name: "app_col"}, {Name: "id"}}},
++			{Schema: "tenant", Name: "orders", Columns: []Column{{Name: "tenant_col"}, {Name: "id"}}},
++			{Schema: "public", Name: "orders", Columns: []Column{{Name: "pub_col"}, {Name: "id"}}},
++			{Schema: "app", Name: "events"},
++		},
++		Views: []View{
++			{Schema: "app", Name: "summary"},
++			{Schema: "public", Name: "summary"},
++		},
++	}
++}
++
++func TestEffectiveSearchPath_LegacyFallback(t *testing.T) {
++	if got := EffectiveSearchPath(nil); !reflect.DeepEqual(got, []string{"public"}) {
++		t.Errorf("nil snap = %v, want [public]", got)
++	}
++	if got := EffectiveSearchPath(&SchemaSnapshot{}); !reflect.DeepEqual(got, []string{"public"}) {
++		t.Errorf("empty path = %v, want [public]", got)
++	}
++	if got := EffectiveSearchPath(&SchemaSnapshot{SearchPath: []string{"  ", "", "x"}}); !reflect.DeepEqual(got, []string{"x"}) {
++		t.Errorf("garbage-only path = %v, want [x]", got)
++	}
++}
++
++func TestEffectiveSearchPath_CleansRepeats(t *testing.T) {
++	s := &SchemaSnapshot{SearchPath: []string{" app ", "app", "tenant", "", "tenant"}}
++	got := EffectiveSearchPath(s)
++	want := []string{"app", "tenant"}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("got %v, want %v", got, want)
++	}
++}
++
++func TestResolver_BareNameFollowsPathOrder(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	tbl, q, ok := r.ResolveTable("", "orders")
++	if !ok {
++		t.Fatal("orders should resolve")
++	}
++	if q.Schema != "app" {
++		t.Fatalf("bare orders resolved to %s, want app", q.Schema)
++	}
++	if len(tbl.Columns) != 2 || tbl.Columns[0].Name != "app_col" {
++		t.Fatalf("got columns %+v, want the app table's own columns", tbl.Columns)
++	}
++}
++
++func TestResolver_ExplicitSchemaNeverFallsBack(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	tbl, q, ok := r.ResolveTable("tenant", "orders")
++	if !ok || q.Schema != "tenant" {
++		t.Fatalf("explicit tenant.orders = %+v %v %v", tbl, q, ok)
++	}
++	if tbl.Columns[0].Name != "tenant_col" {
++		t.Fatalf("got %s's columns from another schema: %+v", q.Schema, tbl.Columns)
++	}
++
++	// an explicit schema that lacks the relation must not fall back to app,
++	// even though app is earlier on the path and holds it
++	if _, _, ok := r.ResolveTable("public", "events"); ok {
++		t.Fatal("public.events must not silently resolve to app.events")
++	}
++	if _, _, ok := r.ResolveTable("missing_schema", "orders"); ok {
++		t.Fatal("missing schema must not fall back along search_path")
++	}
++}
++
++func TestResolver_TableAndViewShareOneRule(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	kind, q, ok := r.LookupRelation("", "summary")
++	if !ok || kind != RelView || q.Schema != "app" {
++		t.Fatalf("bare summary = %v %v %v", kind, q, ok)
++	}
++	kind, _, ok = r.LookupRelation("public", "summary")
++	if !ok || kind != RelView {
++		t.Fatalf("public summary = %v %v", kind, ok)
++	}
++	kind, _, ok = r.LookupRelation("", "events")
++	if !ok || kind != RelTable {
++		t.Fatalf("events = %v %v", kind, ok)
++	}
++	if _, _, ok := r.LookupRelation("", "nope"); ok {
++		t.Fatal("missing relation should report absent")
++	}
++}
++
++func TestResolver_ResolveView(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	v, q, ok := r.ResolveView("", "summary")
++	if !ok || q.Schema != "app" || v.Name != "summary" {
++		t.Fatalf("bare summary view = %+v %v %v", v, q, ok)
++	}
++	if _, _, ok := r.ResolveView("tenant", "summary"); ok {
++		t.Fatal("tenant has no summary view")
++	}
++}
++
++func TestResolver_SchemaNameAndTarget(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	if got := r.ResolveSchemaName("", "orders"); got != "app" {
++		t.Errorf("existing bare name = %q, want app", got)
++	}
++	// a name the snapshot does not hold denotes the creation target
++	if got := r.ResolveSchemaName("", "brand_new"); got != "app" {
++		t.Errorf("new bare name = %q, want app", got)
++	}
++	if got := r.ResolveSchemaName("explicit_schema", "brand_new"); got != "explicit_schema" {
++		t.Errorf("explicit = %q, want explicit_schema", got)
++	}
++	if got := r.TargetSchema(); got != "app" {
++		t.Errorf("target = %q, want app", got)
++	}
++
++	// legacy bundle: creation target stays public
++	legacy := NewResolver(&SchemaSnapshot{Tables: []Table{{Schema: "public", Name: "t"}}})
++	if got := legacy.ResolveSchemaName("", "brand_new"); got != "public" {
++		t.Errorf("legacy target = %q, want public", got)
++	}
++}
++
++func TestResolver_AllNamedRelations(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	got := r.AllNamedRelations("orders")
++	want := []QualifiedName{
++		{Schema: "app", Name: "orders"},
++		{Schema: "public", Name: "orders"},
++		{Schema: "tenant", Name: "orders"},
++	}
++	if !reflect.DeepEqual(got, want) {
++		t.Errorf("holders = %v, want %v", got, want)
++	}
++}
++
++func TestResolver_NilSnapshotIsSafe(t *testing.T) {
++	r := NewResolver(nil)
++	if got := r.Path(); !reflect.DeepEqual(got, []string{"public"}) {
++		t.Errorf("nil resolver path = %v", got)
++	}
++	if _, _, ok := r.ResolveTable("", "anything"); ok {
++		t.Error("nil snapshot must not resolve")
++	}
++	if _, _, ok := r.ResolveTable("app", "anything"); ok {
++		t.Error("nil snapshot explicit lookup must not resolve")
++	}
++}
++
++func TestSearchPathSetting(t *testing.T) {
++	if got := SearchPathSetting(&SchemaSnapshot{SearchPath: []string{"app", "public"}}); got != `"app", "public"` {
++		t.Errorf("setting = %q", got)
++	}
++	// embedded quotes are doubled so SET LOCAL cannot be injected through
++	if got := SearchPathSetting(&SchemaSnapshot{SearchPath: []string{`a"b`}}); got != `"a""b"` {
++		t.Errorf("quoting = %q", got)
++	}
++	if got := SearchPathSetting(nil); got != `"public"` {
++		t.Errorf("legacy setting = %q, want \"public\"", got)
++	}
++}
++
++func TestResolver_PathIsACopy(t *testing.T) {
++	r := NewResolver(searchPathSnap())
++	p := r.Path()
++	p[0] = "mutated"
++	if r.Path()[0] != "app" {
++		t.Fatal("Path() must return a copy; a caller mutated resolver state")
++	}
++}
++
++// search_path is resolution context, not DDL: adding it must not move the
++// content hash, or a capture after this feature would dedupe away from every
++// pre-feature snapshot and old bundles would read as drifted.
++func TestContentHash_IgnoresSearchPath(t *testing.T) {
++	base := func() *SchemaSnapshot {
++		return &SchemaSnapshot{
++			FormatVersion: FormatVersion,
++			Tables:        []Table{{Schema: "app", Name: "orders", Columns: []Column{{Name: "id"}}}},
++		}
++	}
++	without := DigestFor(base())
++	withPath := base()
++	withPath.SearchPath = []string{"app", "tenant", "public"}
++	if got := DigestFor(withPath); got != without {
++		t.Fatalf("search_path moved the content hash: %s vs %s", got, without)
++	}
++}
+diff --git a/pkg/snapshot/types.go b/pkg/snapshot/types.go
+index b1d6e76..cc1465b 100644
+--- a/pkg/snapshot/types.go
++++ b/pkg/snapshot/types.go
+@@ -42,6 +42,15 @@ type (
+ 		Functions        []Function      `json:"functions"`
+ 		Extensions       []Extension     `json:"extensions"`
+ 		GUCs             []GucSetting    `json:"gucs"`
++		// SearchPath is the replayable, effective schema resolution order for
++		// the capturing role at capture time: "$user" already expanded to the
++		// role name, and empty/non-existent entries dropped, in search order.
++		// Every unqualified relation name in offline analysis and in the live
++		// EXPLAIN transaction resolves along this list; an explicit schema
++		// always bypasses it. Empty on bundles captured before this field
++		// existed; those resolve the legacy way, as ["public"]. It is DDL
++		// context, not DDL itself, so it stays out of the content hash.
++		SearchPath []string `json:"search_path,omitempty"`
+ 	}
+ 
+ 	Table struct {

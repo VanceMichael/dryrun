@@ -127,7 +127,7 @@ func constraintsFor(snap *schema.SchemaSnapshot, cat *fileCatalog, rel *pg_query
 		}
 	}
 	if cat != nil {
-		for name, e := range cat.cons[relKey(rel)] {
+		for name, e := range cat.cons[relKey(snap, rel)] {
 			if e.gone {
 				delete(out, name)
 			} else {
@@ -196,7 +196,7 @@ func containsString(list []string, s string) bool {
 }
 
 func (c *fileCatalog) entryFor(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar, name string) *constraintEntry {
-	if e, ok := c.cons[relKey(rel)][name]; ok {
+	if e, ok := c.cons[relKey(snap, rel)][name]; ok {
 		return e
 	}
 	if t := lookupTable(snap, rel); t != nil {
@@ -215,7 +215,7 @@ func (c *fileCatalog) observeAlter(snap *schema.SchemaSnapshot, stmt *pg_query.A
 	if c == nil || rel == nil {
 		return
 	}
-	key := relKey(rel)
+	key := relKey(snap, rel)
 	set := func(e *constraintEntry) {
 		if c.cons[key] == nil {
 			c.cons[key] = map[string]*constraintEntry{}
@@ -246,7 +246,7 @@ func (c *fileCatalog) renameConstraint(snap *schema.SchemaSnapshot, rel *pg_quer
 	if e == nil {
 		return
 	}
-	key := relKey(rel)
+	key := relKey(snap, rel)
 	if c.cons[key] == nil {
 		c.cons[key] = map[string]*constraintEntry{}
 	}
@@ -258,7 +258,7 @@ func (c *fileCatalog) renameConstraint(snap *schema.SchemaSnapshot, rel *pg_quer
 
 // listed once per table per file, not per ALTER.
 func (c *fileCatalog) unvalidatedNote(snap *schema.SchemaSnapshot, rel *pg_query.RangeVar, except string) []string {
-	if c == nil || rel == nil || c.reported[relKey(rel)] {
+	if c == nil || rel == nil || c.reported[relKey(snap, rel)] {
 		return nil
 	}
 	var names []string
@@ -268,7 +268,7 @@ func (c *fileCatalog) unvalidatedNote(snap *schema.SchemaSnapshot, rel *pg_query
 		}
 	}
 	if len(names) > 0 {
-		c.reported[relKey(rel)] = true
+		c.reported[relKey(snap, rel)] = true
 	}
 	return names
 }

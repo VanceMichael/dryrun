@@ -25,57 +25,78 @@ const maxNearMatches = 5
 
 // Order matters. A table name may legally contain a dot ("foo.bar"), so the
 // literal argument is tried before any split; an explicit schema is never
-// overridden by one; and a bare name that lives in several schemas is reported
-// rather than guessed.
+// overridden by one; a bare argument resolves along the snapshot's captured
+// search_path; and a name that sits in several schemas off that path is
+// reported rather than guessed.
 func resolveTable(snap *schema.SchemaSnapshot, req mcp.CallToolRequest) (tableRef, *mcp.CallToolResult) {
 	raw := getArg(req, "table")
 	if raw == "" {
 		return tableRef{}, errResult("table argument is required")
 	}
 	explicit := getArg(req, "schema")
-	lookIn := explicit
-	if lookIn == "" {
-		lookIn = "public"
+	resolver := schema.NewResolver(snap)
+
+	// the schema= argument is an explicit qualifier: it is final and never
+	// falls through to search_path
+	if explicit != "" {
+		if t := findTable(snap, explicit, raw); t != nil {
+			return tableRef{Table: t, Schema: explicit, Name: raw}, nil
+		}
+		// split at the first dot only: a trailing dotted name still resolves
+		// (app."foo.bar"), and the schema half is the part that cannot hold one
+		if i := strings.Index(raw, "."); i > 0 {
+			schemaPart, namePart := raw[:i], raw[i+1:]
+			if t := findTable(snap, schemaPart, namePart); t != nil {
+				// the literal name was tried first and does not exist, so a
+				// qualified argument is the more specific of the two and wins
+				note := ""
+				if schemaPart != explicit {
+					note = fmt.Sprintf("resolved to %s.%s; the qualified table argument outranks schema=%s.",
+						schemaPart, namePart, explicit)
+				}
+				return tableRef{t, schemaPart, namePart, note}, nil
+			}
+		}
+		return tableRef{}, errResult(notFoundMessage(snap, explicit, raw))
 	}
 
-	if t := findTable(snap, lookIn, raw); t != nil {
-		return tableRef{Table: t, Schema: lookIn, Name: raw}, nil
+	// bare argument: the captured search_path order is the identity, so CLI
+	// validation and this lookup pick the same same-named table
+	if t, q, ok := resolver.ResolveTable("", raw); ok {
+		return tableRef{Table: t, Schema: q.Schema, Name: raw}, nil
 	}
 
-	// split at the first dot only: a trailing dotted name still resolves
-	// (app."foo.bar"), and the schema half is the part that cannot contain one
+	// a dotted argument is the caller qualifying the name inline
 	if i := strings.Index(raw, "."); i > 0 {
 		schemaPart, namePart := raw[:i], raw[i+1:]
 		if t := findTable(snap, schemaPart, namePart); t != nil {
-			// the literal name was tried first and does not exist, so a
-			// qualified argument is the more specific of the two and wins
-			note := ""
-			if explicit != "" && schemaPart != explicit {
-				note = fmt.Sprintf("resolved to %s.%s; the qualified table argument outranks schema=%s.",
-					schemaPart, namePart, explicit)
-			}
-			return tableRef{t, schemaPart, namePart, note}, nil
+			return tableRef{Table: t, Schema: schemaPart, Name: namePart}, nil
 		}
 	}
 
-	if explicit == "" {
-		var hits []*schema.Table
-		for i := range snap.Tables {
-			if snap.Tables[i].Name == raw {
-				hits = append(hits, &snap.Tables[i])
-			}
-		}
-		if len(hits) == 1 {
-			return tableRef{Table: hits[0], Schema: hits[0].Schema, Name: hits[0].Name}, nil
-		}
-		if len(hits) > 1 {
-			return tableRef{}, errResult(fmt.Sprintf(
-				"table '%s' exists in %d schemas: %s. pass schema= to choose one.",
-				raw, len(hits), strings.Join(qualifiedNames(hits), ", ")))
+	// nothing on the path: one holder anywhere is still unambiguous; several
+	// holders are the caller's decision
+	var hits []*schema.Table
+	for _, q := range resolver.AllNamedRelations(raw) {
+		if t := findTable(snap, q.Schema, q.Name); t != nil {
+			hits = append(hits, t)
 		}
 	}
+	if len(hits) == 1 {
+		return tableRef{
+			Table:  hits[0],
+			Schema: hits[0].Schema,
+			Name:   hits[0].Name,
+			Note:   fmt.Sprintf("resolved to %s.%s, which is not on the snapshot's search_path (%s); qualify it in SQL.", hits[0].Schema, hits[0].Name, strings.Join(resolver.Path(), ", ")),
+		}, nil
+	}
+	if len(hits) > 1 {
+		return tableRef{}, errResult(fmt.Sprintf(
+			"table '%s' exists in %d schemas: %s. pass schema= to choose one.",
+			raw, len(hits), strings.Join(qualifiedNames(hits), ", ")))
+	}
 
-	return tableRef{}, errResult(notFoundMessage(snap, lookIn, raw))
+	return tableRef{}, errResult(notFoundMessage(snap, "", raw))
 }
 
 // Match is exact: relname is stored as PostgreSQL folded it at creation, so
@@ -99,9 +120,22 @@ func qualifiedNames(tables []*schema.Table) []string {
 }
 
 // A miss ends the agent's line of enquiry unless it carries somewhere to go.
+// The message is stable: an explicit qualifier is quoted verbatim, a bare
+// name names the schemas the captured search_path walked, in that order.
 func notFoundMessage(snap *schema.SchemaSnapshot, schemaName, raw string) string {
-	msg := fmt.Sprintf("table '%s.%s' not found", schemaName, raw)
-	if v := findView(snap, raw); v != "" {
+	var msg string
+	switch {
+	case schemaName != "":
+		msg = fmt.Sprintf("table '%s.%s' not found", schemaName, raw)
+	default:
+		path := schema.EffectiveSearchPath(snap)
+		if len(path) == 1 && path[0] == schema.LegacyDefaultSchema {
+			msg = fmt.Sprintf("table '%s.%s' not found", schema.LegacyDefaultSchema, raw)
+		} else {
+			msg = fmt.Sprintf("table '%s' not found (searched schemas: %s)", raw, strings.Join(path, ", "))
+		}
+	}
+	if v := findView(snap, schemaName, raw); v != "" {
 		return msg + fmt.Sprintf("; %s is a view, and describe_table covers tables only", v)
 	}
 	if near := nearMatches(snap, raw); len(near) > 0 {
@@ -110,15 +144,43 @@ func notFoundMessage(snap *schema.SchemaSnapshot, schemaName, raw string) string
 	return msg + fmt.Sprintf(`; find_objects {"query":"%s"} searches every schema`, searchTerm(raw))
 }
 
-// A view read out of find_objects is the likeliest remaining miss.
-func findView(snap *schema.SchemaSnapshot, raw string) string {
+// A view read out of find_objects is the likeliest remaining miss. A dotted
+// argument is matched exactly (its schema half is explicit); a bare name
+// follows the captured search_path; a lone holder elsewhere is the
+// legacy-compatible last resort.
+func findView(snap *schema.SchemaSnapshot, schemaName, raw string) string {
 	name := searchTerm(raw)
+	if schemaName != "" {
+		for _, v := range snap.Views {
+			if v.Name == name && v.Schema == schemaName {
+				return v.Schema + "." + v.Name
+			}
+		}
+		return ""
+	}
+	// the argument may self-qualify even without a schema= parameter
+	if i := strings.Index(raw, "."); i > 0 {
+		sp, np := raw[:i], raw[i+1:]
+		for _, v := range snap.Views {
+			if v.Name == np && v.Schema == sp {
+				return v.Schema + "." + v.Name
+			}
+		}
+		return ""
+	}
+	if v, q, ok := schema.NewResolver(snap).ResolveView("", name); ok {
+		return q.Schema + "." + v.Name
+	}
+	var hit string
 	for _, v := range snap.Views {
 		if v.Name == name {
-			return v.Schema + "." + v.Name
+			if hit != "" {
+				return "" // several holders: name the table miss, not a guess
+			}
+			hit = v.Schema + "." + v.Name
 		}
 	}
-	return ""
+	return hit
 }
 
 // The searchable part of a name the caller may have qualified already.

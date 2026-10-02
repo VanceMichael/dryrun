@@ -24,7 +24,8 @@ type Advice struct {
 func Advise(plan *PlanNode, a *schema.AnnotatedSchema) []Advice {
 	var advice []Advice
 	snap := a.Schema
-	walkForAdvice(plan, a, &advice)
+	resolver := schema.NewResolver(snap)
+	walkForAdvice(plan, a, resolver, &advice)
 
 	if suggestions, err := SuggestIndex("", snap, plan); err == nil && len(suggestions) > 0 {
 		for i := range advice {
@@ -79,38 +80,34 @@ func perNodeBreakdown(a *schema.AnnotatedSchema, qualified string) string {
 	return strings.Join(lines, "\n")
 }
 
-func walkForAdvice(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) {
-	adviseSeqScan(node, a, advice)
-	adviseNestedLoopSeqScan(node, advice)
-	adviseSort(node, a.Schema, advice)
-	adviseIndexScanBloat(node, a, advice)
+func walkForAdvice(node *PlanNode, a *schema.AnnotatedSchema, resolver *schema.Resolver, advice *[]Advice) {
+	adviseSeqScan(node, a, resolver, advice)
+	adviseNestedLoopSeqScan(node, resolver, advice)
+	adviseSort(node, resolver, advice)
+	adviseIndexScanBloat(node, a, resolver, advice)
 	adviseCTE(node, advice)
 
 	for i := range node.Children {
-		walkForAdvice(&node.Children[i], a, advice)
+		walkForAdvice(&node.Children[i], a, resolver, advice)
 	}
 }
 
-func adviseSeqScan(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) {
+func adviseSeqScan(node *PlanNode, a *schema.AnnotatedSchema, resolver *schema.Resolver, advice *[]Advice) {
 	if node.NodeType != "Seq Scan" || node.RelationName == nil || node.PlanRows < 10_000 {
 		return
 	}
 
 	tableName := *node.RelationName
-	schemaName := "public"
+	// a live plan always carries the schema the planner used; pasted plans
+	// without one resolve along the captured search_path, so sizing and stats
+	// below never come from a same-named table in another schema
+	explicit := ""
 	if node.Schema != nil {
-		schemaName = *node.Schema
+		explicit = *node.Schema
 	}
+	table, qual, _ := resolver.ResolveTable(explicit, tableName)
+	schemaName := qual.Schema
 	qualified := schemaName + "." + tableName
-	qual := schema.QualifiedName{Schema: schemaName, Name: tableName}
-
-	var table *schema.Table
-	for i := range a.Schema.Tables {
-		if a.Schema.Tables[i].Name == tableName && a.Schema.Tables[i].Schema == schemaName {
-			table = &a.Schema.Tables[i]
-			break
-		}
-	}
 
 	filterCol := extractColumnFromFilter(node.Filter)
 
@@ -206,7 +203,7 @@ func adviseSeqScan(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) 
 	})
 }
 
-func adviseNestedLoopSeqScan(node *PlanNode, advice *[]Advice) {
+func adviseNestedLoopSeqScan(node *PlanNode, resolver *schema.Resolver, advice *[]Advice) {
 	if node.NodeType != "Nested Loop" || len(node.Children) < 2 {
 		return
 	}
@@ -219,10 +216,12 @@ func adviseNestedLoopSeqScan(node *PlanNode, advice *[]Advice) {
 	if inner.RelationName != nil {
 		tableName = *inner.RelationName
 	}
-	schemaName := "public"
+	explicit := ""
 	if inner.Schema != nil {
-		schemaName = *inner.Schema
+		explicit = *inner.Schema
 	}
+	_, qual, _ := resolver.ResolveTable(explicit, tableName)
+	schemaName := qual.Schema
 	qualified := schemaName + "." + tableName
 
 	filterCol := extractColumnFromFilter(inner.Filter)
@@ -242,7 +241,7 @@ func adviseNestedLoopSeqScan(node *PlanNode, advice *[]Advice) {
 	})
 }
 
-func adviseSort(node *PlanNode, _ *schema.SchemaSnapshot, advice *[]Advice) {
+func adviseSort(node *PlanNode, _ *schema.Resolver, advice *[]Advice) {
 	if node.NodeType != "Sort" || node.PlanRows < 10_000 || len(node.SortKey) == 0 {
 		return
 	}
@@ -320,7 +319,7 @@ func versionNoteForIndex() *string {
 		"Use INCLUDE for covering indexes to enable index-only scans.")
 }
 
-func adviseIndexScanBloat(node *PlanNode, a *schema.AnnotatedSchema, advice *[]Advice) {
+func adviseIndexScanBloat(node *PlanNode, a *schema.AnnotatedSchema, resolver *schema.Resolver, advice *[]Advice) {
 	if node.IndexName == nil {
 		return
 	}
@@ -329,28 +328,21 @@ func adviseIndexScanBloat(node *PlanNode, a *schema.AnnotatedSchema, advice *[]A
 	}
 
 	tableName := ""
-	schemaName := "public"
 	if node.RelationName != nil {
 		tableName = *node.RelationName
-	}
-	if node.Schema != nil {
-		schemaName = *node.Schema
 	}
 	if tableName == "" {
 		return
 	}
-	qual := schema.QualifiedName{Schema: schemaName, Name: tableName}
-
-	var table *schema.Table
-	for i := range a.Schema.Tables {
-		if a.Schema.Tables[i].Name == tableName && a.Schema.Tables[i].Schema == schemaName {
-			table = &a.Schema.Tables[i]
-			break
-		}
+	explicit := ""
+	if node.Schema != nil {
+		explicit = *node.Schema
 	}
-	if table == nil {
+	table, qual, ok := resolver.ResolveTable(explicit, tableName)
+	if !ok {
 		return
 	}
+	schemaName := qual.Schema
 
 	indexName := *node.IndexName
 	for _, idx := range table.Indexes {
