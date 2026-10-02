@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -79,13 +80,16 @@ func snapshotListCmd(historyDB *string) *cobra.Command {
 				}
 			}
 			for _, s := range shown {
-				hash := s.ContentHash
-				if len(hash) > 16 {
-					hash = hash[:16]
-				}
-				fmt.Printf("%s  %-*s  %s  %s\n",
-					s.Timestamp.Format("2006-01-02 15:04:05"),
-					typeW, s.Kind.String(), hash, s.Database)
+			hash := s.ContentHash
+			if len(hash) > 16 {
+				hash = hash[:16]
+			}
+			fmt.Printf("%s  %-*s  %s  %s%s\n",
+				s.Timestamp.Format("2006-01-02 15:04:05"),
+				typeW, s.Kind.String(), hash, s.Database, payloadCorruptMarker(s))
+		}
+			if corrupt := countCorruptRows(shown); corrupt > 0 {
+				fmt.Fprintf(os.Stderr, "\nwarning: %d snapshot row(s) have an unreadable payload; latest serves the nearest older valid record\n", corrupt)
 			}
 			if len(shown) < total {
 				fmt.Printf("\n%d of %d snapshot(s) (--limit %d)\n", len(shown), total, limit)
@@ -102,6 +106,27 @@ func snapshotListCmd(historyDB *string) *cobra.Command {
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "output as JSON")
 	cmd.Flags().BoolVar(&prettyOut, "pretty", false, "pretty-print JSON")
 	return cmd
+}
+
+// countCorruptRows counts listed rows whose payload cannot be decoded or
+// whose embedded identity disagrees with its columns.
+func countCorruptRows(summaries []history.SnapshotSummary) int {
+	n := 0
+	for i := range summaries {
+		if summaries[i].PayloadCorrupt {
+			n++
+		}
+	}
+	return n
+}
+
+// payloadCorruptMarker flags a row tolerant latest skips. It carries the
+// fact, never the damaged bytes.
+func payloadCorruptMarker(s history.SnapshotSummary) string {
+	if s.PayloadCorrupt {
+		return "  PAYLOAD CORRUPT (latest skips this record)"
+	}
+	return ""
 }
 
 // Newest first. Timestamps are second-resolution and `capture --all` writes a

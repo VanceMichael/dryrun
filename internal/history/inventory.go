@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -42,6 +43,11 @@ type (
 		// rows whose timestamp will not parse: excluded from the span above,
 		// counted here rather than dropped silently, as ListNodes does
 		CorruptRows int `json:"corrupt_rows,omitempty"`
+		// rows whose payload cannot be decoded or whose embedded identity
+		// (content hash; schema ref; node source) disagrees with the row
+		// columns. Latest assembly skips these newest-to-oldest; this count is
+		// store-wide and content-free, unlike the per-fallback report.
+		PayloadCorruptRows int `json:"payload_corrupt_rows,omitempty"`
 	}
 )
 
@@ -98,28 +104,39 @@ func (s *Store) streamSpan(ctx context.Context, key SnapshotKey, stream, table s
 	if perNode {
 		nodes = "COUNT(DISTINCT node_source)"
 	}
+	// the schema stream is the only one whose payload column is snapshot_json
+	// and whose rows carry no schema_ref_hash/node_source columns
+	payloadCol := "payload_json"
+	hasSchemaRef := true
+	if table == "snapshots" {
+		payloadCol = "snapshot_json"
+		hasSchemaRef = false
+	}
 	q := `SELECT COUNT(*),
 	             SUM(CASE WHEN timestamp GLOB ? THEN 0 ELSE 1 END),
 	             MIN(CASE WHEN timestamp GLOB ? THEN timestamp END),
 	             MAX(CASE WHEN timestamp GLOB ? THEN timestamp END),
-	             ` + nodes + `
+	             ` + nodes + `,
+	             SUM(CASE WHEN ` + payloadOKExpr(payloadCol, hasSchemaRef, perNode) + ` THEN 0 ELSE 1 END)
 	        FROM ` + table + `
 	       WHERE project_id = ? AND database_id = ?`
 
 	var (
 		span           = StreamSpan{Stream: stream}
 		corrupt        sql.NullInt64
+		payloadCorrupt sql.NullInt64
 		oldest, newest sql.NullString
 		nodeCount      int
 	)
 	err := s.db.QueryRowContext(ctx, q,
 		readableTS, readableTS, readableTS,
 		string(key.ProjectID), string(key.DatabaseID),
-	).Scan(&span.Rows, &corrupt, &oldest, &newest, &nodeCount)
+	).Scan(&span.Rows, &corrupt, &oldest, &newest, &nodeCount, &payloadCorrupt)
 	if err != nil {
 		return StreamSpan{}, err
 	}
 	span.CorruptRows = int(corrupt.Int64)
+	span.PayloadCorruptRows = int(payloadCorrupt.Int64)
 	if perNode {
 		span.Nodes = &nodeCount
 	}
@@ -132,6 +149,26 @@ func (s *Store) streamSpan(ctx context.Context, key SnapshotKey, stream, table s
 	span.Newest = spanBound(newest, unreadable)
 	span.CorruptRows += len(unreadable)
 	return span, nil
+}
+
+// payloadOKExpr is the SQLite predicate for "this row's payload decodes and
+// its embedded identity agrees with its columns" -- the same rule tolerant
+// latest assembly enforces in Go. It only inspects JSON structure and scalar
+// fields, so it never surfaces payload bytes in an error.
+func payloadOKExpr(payloadCol string, hasSchemaRef, perNode bool) string {
+	conds := []string{
+		"json_valid(" + payloadCol + ")",
+		"json_extract(" + payloadCol + ", '$.content_hash') = content_hash",
+	}
+	if hasSchemaRef {
+		conds = append(conds,
+			"json_extract("+payloadCol+", '$.schema_ref_hash') = schema_ref_hash")
+		if perNode {
+			conds = append(conds,
+				"json_extract("+payloadCol+", '$.node.source') = node_source")
+		}
+	}
+	return strings.Join(conds, " AND ")
 }
 
 // The newest attempt per stream, folded across node labels: one node still

@@ -221,43 +221,24 @@ func (s *Store) GetQueryStats(ctx context.Context, key SnapshotKey, schemaRefHas
 	return out, rows.Err()
 }
 
-// LatestQueryStats returns the newest snapshot per node_source. Unlike
+// LatestQueryStats returns the newest VALID snapshot per node_source. Unlike
 // GetQueryStats it is not schema_ref_hash-scoped, so callers still get the
-// latest stats after DDL has moved on. Ties on timestamp (two pushes for the
-// same node within the same RFC3339 second) are broken by id so a node never
-// contributes more than one row.
+// latest stats after DDL has moved on. A node whose newest payload is torn
+// falls back to its own next-newest decodable, identity-consistent row, so
+// one bad capture never blanks every node; a node with no valid row is
+// omitted. Ties on timestamp (two pushes for the same node within the same
+// RFC3339 second) are broken by id so a node never contributes more than one
+// row. This is a latest selection, so it tolerates corruption -- explicit
+// refs stay strict.
 func (s *Store) LatestQueryStats(ctx context.Context, key SnapshotKey) ([]schema.QueryStatsSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT payload_json FROM query_stats AS q
-		  WHERE project_id = ? AND database_id = ?
-		    AND id = (
-		      SELECT id FROM query_stats
-		       WHERE project_id = q.project_id
-		         AND database_id = q.database_id
-		         AND node_source = q.node_source
-		       ORDER BY timestamp DESC, id DESC LIMIT 1
-		    )
-		  ORDER BY node_source`,
-		string(key.ProjectID), string(key.DatabaseID),
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []schema.QueryStatsSnapshot
-	for rows.Next() {
-		var jsonStr string
-		if err := rows.Scan(&jsonStr); err != nil {
-			return nil, err
-		}
-		var q schema.QueryStatsSnapshot
-		if err := json.Unmarshal([]byte(jsonStr), &q); err != nil {
-			return nil, fmt.Errorf("corrupt query stats JSON: %w", err)
-		}
-		out = append(out, q)
-	}
-	return out, rows.Err()
+	out, _, err := scanLatestValidNodeRows[schema.QueryStatsSnapshot](
+		ctx, s.db, "query_stats", "query",
+		string(key.ProjectID), string(key.DatabaseID), "",
+		func(q *schema.QueryStatsSnapshot, contentHash, schemaRefHash, node string) bool {
+			return q.ContentHash != "" && q.ContentHash == contentHash &&
+				q.SchemaRefHash == schemaRefHash && q.Node.Source == node
+		})
+	return out, err
 }
 
 // PreviousQueryStats returns, per node_source, the capture the newest one is
@@ -302,30 +283,41 @@ func (s *Store) PreviousQueryStats(ctx context.Context, key SnapshotKey) ([]sche
 	return s.previousWithinMember(ctx, key, out)
 }
 
+// LatestPlanner returns the newest VALID planner capture across schema
+// generations. It is a latest selection, so a torn newest row falls back to
+// the nearest older decodable, identity-consistent one; only a completely
+// empty planner table is ErrSnapshotNotFound.
 func (s *Store) LatestPlanner(ctx context.Context, key SnapshotKey) (*schema.PlannerStatsSnapshot, error) {
-	var jsonStr string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT payload_json FROM planner_stats
-		  WHERE project_id = ? AND database_id = ?
-		  ORDER BY timestamp DESC, id DESC LIMIT 1`,
-		string(key.ProjectID), string(key.DatabaseID),
-	).Scan(&jsonStr)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("%w (latest planner)", ErrSnapshotNotFound)
-	}
+	p, fb, err := s.latestValidPlannerRow(ctx,
+		string(key.ProjectID), string(key.DatabaseID), "")
 	if err != nil {
 		return nil, err
 	}
-
-	var p schema.PlannerStatsSnapshot
-	if err := json.Unmarshal([]byte(jsonStr), &p); err != nil {
-		return nil, fmt.Errorf("corrupt planner stats JSON: %w", err)
+	if p != nil {
+		return p, nil
 	}
-	return &p, nil
+	if fb.Reason != "" {
+		// rows existed but none usable: the caller treats nil as "no stamp",
+		// which for a best-effort pending marker is the right degradation
+		slog.Debug("LatestPlanner found only unusable payloads", "reason", fb.Reason)
+		return nil, nil
+	}
+	return nil, fmt.Errorf("%w (latest planner)", ErrSnapshotNotFound)
 }
 
-// ErrSnapshotNotFound only when schema is missing; planner/activity can be absent
+// ErrSnapshotNotFound only when schema is missing; planner/activity can be absent.
+//
+// Only an unqualified latest tolerates corruption: it resolves newest-to-oldest
+// and serves the nearest decodable, identity-consistent generation (see
+// GetAnnotatedLatest). Every other ref — a content hash, latest~N, a point in
+// time — names one record and must fail against that record, so a corrupt row
+// there stays a loud error instead of silently switching targets.
 func (s *Store) GetAnnotated(ctx context.Context, key SnapshotKey, at SnapshotRef) (*schema.AnnotatedSchema, error) {
+	if at.Kind == RefLatest {
+		a, _, err := s.GetAnnotatedLatest(ctx, key)
+		return a, err
+	}
+
 	snap, err := s.GetSchema(ctx, key, at)
 	if err != nil {
 		return nil, err
@@ -343,26 +335,9 @@ func (s *Store) GetAnnotated(ctx context.Context, key SnapshotKey, at SnapshotRe
 		return nil, err
 	}
 	if len(acts) > 0 {
-		var nodes []schema.NodeActivity
-		// newest row per label stays first: oldestActivityStamp and
-		// PrimaryActivity read the first entry per label
-		add := func(r schema.ActivityStatsSnapshot) {
-			tables, indexes := schema.RollUpPartitionActivity(snap, r.Tables, r.Indexes)
-			nodes = append(nodes, schema.NodeActivity{Node: r.Node, Tables: tables, Indexes: indexes})
-		}
-		for i := range acts {
-			// best-effort: without them the label keeps its newest row
-			members, err := s.activityMembers(ctx, key, snap.ContentHash, acts[i])
-			if err != nil {
-				if ctxErr(err) {
-					return nil, err
-				}
-				slog.Debug("pool servers unavailable; label keeps its newest row", "node", acts[i].Node.Source, "error", err)
-			}
-			add(acts[i])
-			for _, m := range members {
-				add(m)
-			}
+		nodes, err := s.joinActivityNodes(ctx, key, snap, acts)
+		if err != nil {
+			return nil, err
 		}
 		out.Merged = &schema.MergedActivity{Nodes: nodes}
 	}
@@ -412,9 +387,26 @@ func resolveHashPrefix(ctx context.Context, db *sql.DB, prefix, query string, ar
 }
 
 // getPlannerRef resolves a SnapshotRef against the planner_stats table.
+// Only RefLatest tolerates a torn newest row (newest-to-oldest recovery);
+// hash/at/index name one record and fail against it.
 func (s *Store) getPlannerRef(ctx context.Context, key SnapshotKey, at SnapshotRef) (*schema.PlannerStatsSnapshot, error) {
 	pid := string(key.ProjectID)
 	did := string(key.DatabaseID)
+
+	if at.Kind == RefLatest {
+		const detail = "latest planner"
+		p, fb, err := s.latestValidPlannerRow(ctx, pid, did, "")
+		if err != nil {
+			return nil, err
+		}
+		if p == nil {
+			if fb.Reason != "" {
+				return nil, fmt.Errorf("%w (%s): %s", ErrHistoryCorrupt, detail, fb.Reason)
+			}
+			return nil, fmt.Errorf("%w (%s)", ErrSnapshotNotFound, detail)
+		}
+		return p, nil
+	}
 
 	var (
 		jsonStr string
@@ -422,14 +414,6 @@ func (s *Store) getPlannerRef(ctx context.Context, key SnapshotKey, at SnapshotR
 		detail  string
 	)
 	switch at.Kind {
-	case RefLatest:
-		detail = "latest planner"
-		err = s.db.QueryRowContext(ctx,
-			`SELECT payload_json FROM planner_stats
-			  WHERE project_id = ? AND database_id = ?
-			  ORDER BY timestamp DESC, id DESC LIMIT 1`,
-			pid, did,
-		).Scan(&jsonStr)
 	case RefAt:
 		detail = fmt.Sprintf("planner at-or-before %s", at.At.Format(time.RFC3339))
 		err = s.db.QueryRowContext(ctx,
@@ -478,10 +462,32 @@ func (s *Store) getPlannerRef(ctx context.Context, key SnapshotKey, at SnapshotR
 }
 
 // getActivityRef resolves a SnapshotRef against activity_stats, optionally
-// filtered to a single node_source.
+// filtered to a single node_source. Only RefLatest tolerates a torn newest
+// row; hash/at/index name one record and fail against it.
 func (s *Store) getActivityRef(ctx context.Context, key SnapshotKey, nodeLabel string, at SnapshotRef) (*schema.ActivityStatsSnapshot, error) {
 	pid := string(key.ProjectID)
 	did := string(key.DatabaseID)
+
+	if at.Kind == RefLatest {
+		detail := "latest activity"
+		a, skipped, saw, err := latestValidNodeStatRow[schema.ActivityStatsSnapshot](
+			ctx, s.db, "activity_stats", pid, did, nodeLabel, "",
+			func(v *schema.ActivityStatsSnapshot, contentHash, schemaRefHash, node string) bool {
+				return v.ContentHash != "" && v.ContentHash == contentHash &&
+					v.SchemaRefHash == schemaRefHash && v.Node.Source == node
+			})
+		if err != nil {
+			return nil, err
+		}
+		if a != nil {
+			return a, nil
+		}
+		if !saw {
+			return nil, fmt.Errorf("%w (%s)", ErrSnapshotNotFound, detail)
+		}
+		return nil, fmt.Errorf("%w (%s): skipped %d unusable newest row(s)",
+			ErrHistoryCorrupt, detail, skipped)
+	}
 
 	where := ` FROM activity_stats
 	           WHERE project_id = ? AND database_id = ?`
@@ -498,9 +504,6 @@ func (s *Store) getActivityRef(ctx context.Context, key SnapshotKey, nodeLabel s
 		detail  string
 	)
 	switch at.Kind {
-	case RefLatest:
-		detail = "latest activity"
-		err = s.db.QueryRowContext(ctx, base+" ORDER BY timestamp DESC, id DESC LIMIT 1", args...).Scan(&jsonStr)
 	case RefAt:
 		detail = fmt.Sprintf("activity at-or-before %s", at.At.Format(time.RFC3339))
 		args = append(args, formatHistoryTS(at.At))
@@ -545,7 +548,8 @@ func (s *Store) listPlanner(ctx context.Context, key SnapshotKey, rng TimeRange)
 		sb   strings.Builder
 		args []any
 	)
-	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, timestamp, project_id, database_id
+	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, timestamp, project_id, database_id,
+	                       CASE WHEN ` + payloadOKExpr("payload_json", true, false) + ` THEN 0 ELSE 1 END
 	                  FROM planner_stats WHERE project_id = ? AND database_id = ?`)
 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
 	if rng.From != nil {
@@ -567,12 +571,12 @@ func (s *Store) listPlanner(ctx context.Context, key SnapshotKey, rng TimeRange)
 	var out []SnapshotSummary
 	for rows.Next() {
 		var (
-			ss    SnapshotSummary
-			tsStr string
-			pid   sql.NullString
-			did   sql.NullString
+			ss             SnapshotSummary
+			tsStr          string
+			pid, did       sql.NullString
+			payloadCorrupt int
 		)
-		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &tsStr, &pid, &did); err != nil {
+		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &tsStr, &pid, &did, &payloadCorrupt); err != nil {
 			return nil, err
 		}
 		ss.Kind = PlannerKind()
@@ -585,6 +589,7 @@ func (s *Store) listPlanner(ctx context.Context, key SnapshotKey, rng TimeRange)
 			v := did.String
 			ss.DatabaseID = &v
 		}
+		ss.PayloadCorrupt = payloadCorrupt != 0
 		out = append(out, ss)
 	}
 	return out, rows.Err()
@@ -595,7 +600,8 @@ func (s *Store) listActivity(ctx context.Context, key SnapshotKey, nodeLabel str
 		sb   strings.Builder
 		args []any
 	)
-	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id
+	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id,
+	                       CASE WHEN ` + payloadOKExpr("payload_json", true, true) + ` THEN 0 ELSE 1 END
 	                  FROM activity_stats WHERE project_id = ? AND database_id = ?`)
 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
 	if nodeLabel != "" {
@@ -621,13 +627,12 @@ func (s *Store) listActivity(ctx context.Context, key SnapshotKey, nodeLabel str
 	var out []SnapshotSummary
 	for rows.Next() {
 		var (
-			ss    SnapshotSummary
-			tsStr string
-			label string
-			pid   sql.NullString
-			did   sql.NullString
+			ss             SnapshotSummary
+			tsStr, label   string
+			pid, did       sql.NullString
+			payloadCorrupt int
 		)
-		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did); err != nil {
+		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did, &payloadCorrupt); err != nil {
 			return nil, err
 		}
 		ss.Kind = ActivityKind(label)
@@ -641,16 +646,39 @@ func (s *Store) listActivity(ctx context.Context, key SnapshotKey, nodeLabel str
 			v := did.String
 			ss.DatabaseID = &v
 		}
+		ss.PayloadCorrupt = payloadCorrupt != 0
 		out = append(out, ss)
 	}
 	return out, rows.Err()
 }
 
 // getQueryStatsRef resolves a SnapshotRef against query_stats, optionally
-// filtered to a single node_source.
+// filtered to a single node_source. Only RefLatest tolerates a torn newest
+// row; hash/at/index name one record and fail against it.
 func (s *Store) getQueryStatsRef(ctx context.Context, key SnapshotKey, nodeLabel string, at SnapshotRef) (*schema.QueryStatsSnapshot, error) {
 	pid := string(key.ProjectID)
 	did := string(key.DatabaseID)
+
+	if at.Kind == RefLatest {
+		detail := "latest query stats"
+		q, skipped, saw, err := latestValidNodeStatRow[schema.QueryStatsSnapshot](
+			ctx, s.db, "query_stats", pid, did, nodeLabel, "",
+			func(v *schema.QueryStatsSnapshot, contentHash, schemaRefHash, node string) bool {
+				return v.ContentHash != "" && v.ContentHash == contentHash &&
+					v.SchemaRefHash == schemaRefHash && v.Node.Source == node
+			})
+		if err != nil {
+			return nil, err
+		}
+		if q != nil {
+			return q, nil
+		}
+		if !saw {
+			return nil, fmt.Errorf("%w (%s)", ErrSnapshotNotFound, detail)
+		}
+		return nil, fmt.Errorf("%w (%s): skipped %d unusable newest row(s)",
+			ErrHistoryCorrupt, detail, skipped)
+	}
 
 	where := ` FROM query_stats
 	           WHERE project_id = ? AND database_id = ?`
@@ -667,10 +695,6 @@ func (s *Store) getQueryStatsRef(ctx context.Context, key SnapshotKey, nodeLabel
 		detail  string
 	)
 	switch at.Kind {
-	case RefLatest:
-		detail = "latest query stats"
-		// id tiebreak: same-second captures collide at RFC3339 granularity
-		err = s.db.QueryRowContext(ctx, base+" ORDER BY timestamp DESC, id DESC LIMIT 1", args...).Scan(&jsonStr)
 	case RefAt:
 		detail = fmt.Sprintf("query stats at-or-before %s", at.At.Format(time.RFC3339))
 		args = append(args, formatHistoryTS(at.At))
@@ -715,7 +739,8 @@ func (s *Store) listQueryStats(ctx context.Context, key SnapshotKey, nodeLabel s
 		sb   strings.Builder
 		args []any
 	)
-	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id
+	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id,
+	                       CASE WHEN ` + payloadOKExpr("payload_json", true, true) + ` THEN 0 ELSE 1 END
 	                  FROM query_stats WHERE project_id = ? AND database_id = ?`)
 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
 	if nodeLabel != "" {
@@ -741,13 +766,12 @@ func (s *Store) listQueryStats(ctx context.Context, key SnapshotKey, nodeLabel s
 	var out []SnapshotSummary
 	for rows.Next() {
 		var (
-			ss    SnapshotSummary
-			tsStr string
-			label string
-			pid   sql.NullString
-			did   sql.NullString
+			ss             SnapshotSummary
+			tsStr, label   string
+			pid, did       sql.NullString
+			payloadCorrupt int
 		)
-		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did); err != nil {
+		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did, &payloadCorrupt); err != nil {
 			return nil, err
 		}
 		ss.Kind = QueryKind(label)
@@ -761,6 +785,7 @@ func (s *Store) listQueryStats(ctx context.Context, key SnapshotKey, nodeLabel s
 			v := did.String
 			ss.DatabaseID = &v
 		}
+		ss.PayloadCorrupt = payloadCorrupt != 0
 		out = append(out, ss)
 	}
 	return out, rows.Err()
@@ -795,37 +820,18 @@ func (s *Store) LatestNodeRole(ctx context.Context, key SnapshotKey, nodeLabel s
 	return roleFromExtract(standby), nil
 }
 
-// one row per node, taken at the most recent timestamp per node_source
+// LatestActivity returns the newest VALID capture per node_source across all
+// schema generations. A torn newest row falls back to that node's next-newest
+// decodable, identity-consistent capture instead of failing the whole read;
+// nodes with no valid row are omitted. Latest selection, so tolerant --
+// explicit refs stay strict.
 func (s *Store) LatestActivity(ctx context.Context, key SnapshotKey) ([]schema.ActivityStatsSnapshot, error) {
-	rows, err := s.db.QueryContext(ctx,
-		`SELECT payload_json FROM activity_stats AS a
-		  WHERE project_id = ? AND database_id = ?
-		    AND id = (
-		      SELECT id FROM activity_stats
-		       WHERE project_id = a.project_id
-		         AND database_id = a.database_id
-		         AND node_source = a.node_source
-		       ORDER BY timestamp DESC, id DESC LIMIT 1
-		    )
-		  ORDER BY node_source`,
-		string(key.ProjectID), string(key.DatabaseID),
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var out []schema.ActivityStatsSnapshot
-	for rows.Next() {
-		var jsonStr string
-		if err := rows.Scan(&jsonStr); err != nil {
-			return nil, err
-		}
-		var a schema.ActivityStatsSnapshot
-		if err := json.Unmarshal([]byte(jsonStr), &a); err != nil {
-			return nil, fmt.Errorf("corrupt activity stats JSON: %w", err)
-		}
-		out = append(out, a)
-	}
-	return out, rows.Err()
+	out, _, err := scanLatestValidNodeRows[schema.ActivityStatsSnapshot](
+		ctx, s.db, "activity_stats", "activity",
+		string(key.ProjectID), string(key.DatabaseID), "",
+		func(a *schema.ActivityStatsSnapshot, contentHash, schemaRefHash, node string) bool {
+			return a.ContentHash != "" && a.ContentHash == contentHash &&
+				a.SchemaRefHash == schemaRefHash && a.Node.Source == node
+		})
+	return out, err
 }

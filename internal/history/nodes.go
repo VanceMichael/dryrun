@@ -30,6 +30,14 @@ type (
 		RoleFlipped bool `json:"role_flipped,omitempty"`
 		// a timestamp that would not parse; LastCapture is zero
 		CorruptRows int `json:"corrupt_rows,omitempty"`
+		// payload rows that will not decode, or whose embedded identity
+		// (content hash / schema ref / node source) disagrees with their
+		// columns, across both node-scoped streams. Content-free count.
+		PayloadCorruptRows int `json:"payload_corrupt_rows,omitempty"`
+		// what tolerant latest resolution does with this node's newest
+		// capture per stream: skipped rows above the served capture, or an
+		// unavailable stream whose every payload is unusable
+		PayloadFallback []NodeStreamFallback `json:"payload_fallback,omitempty"`
 		// distinct servers seen under this label in the recent window, and
 		// whether they alternate (a rotating endpoint) rather than succeed
 		// one another (a restart or a replacement)
@@ -50,6 +58,18 @@ type (
 	NodeFingerprint struct {
 		StartedAt  time.Time
 		ServerAddr string
+	}
+
+	// NodeStreamFallback describes tolerant latest resolution for one of a
+	// node's streams. A clean newest capture produces no entry at all.
+	NodeStreamFallback struct {
+		Stream string `json:"stream"`
+		// unusable rows newer than the capture latest actually serves
+		Skipped int `json:"skipped_payloads,omitempty"`
+		// the capture latest serves this node from; nil when every row was unusable
+		ServedAt *time.Time `json:"served_at,omitempty"`
+		// the stream has rows for this node but none could be served
+		Unavailable bool `json:"unavailable,omitempty"`
 	}
 
 	nodeAgg struct {
@@ -123,6 +143,10 @@ func (s *Store) ListNodes(ctx context.Context, key SnapshotKey) ([]NodeSummary, 
 	}
 
 	out := make([]NodeSummary, 0, len(byLabel))
+	recovery, err := s.nodePayloadRecovery(ctx, key)
+	if err != nil {
+		return nil, err
+	}
 	for _, n := range byLabel {
 		role, err := s.LatestNodeRole(ctx, key, n.Label)
 		if err != nil {
@@ -131,6 +155,10 @@ func (s *Store) ListNodes(ctx context.Context, key SnapshotKey) ([]NodeSummary, 
 		n.Role = role
 		if r := seen[n.Label]; r != nil {
 			n.RoleFlipped = r.primary && r.standby
+		}
+		if agg, ok := recovery[n.Label]; ok {
+			n.PayloadCorruptRows = agg.corruptRows
+			n.PayloadFallback = agg.fallback
 		}
 		fps, err := s.RecentNodeFingerprints(ctx, key, n.Label)
 		if err != nil {
@@ -370,6 +398,114 @@ func (s *Store) aggregateNodes(ctx context.Context, key SnapshotKey, table strin
 func nodeJSONExpr(prefix, path string) string {
 	col := prefix + "payload_json"
 	return "CASE WHEN json_valid(" + col + ") THEN json_extract(" + col + ", '" + path + "') END"
+}
+
+// nodePayloadAgg is the per-label accumulation across both node tables.
+type nodePayloadAgg struct {
+	corruptRows int
+	fallback    []NodeStreamFallback
+}
+
+// nodePayloadRecovery walks each node-scoped stream newest-first per node and
+// reports what tolerant latest resolution would do with it: unusable rows
+// above the served capture, and a stream with no servable row at all. The
+// validity rule matches GetAnnotatedLatest (decode plus identity agreement).
+// Rows whose timestamp will not parse are excluded -- they are already the
+// timestamp CorruptRows tally and cannot be placed newest-to-oldest.
+func (s *Store) nodePayloadRecovery(ctx context.Context, key SnapshotKey) (map[string]nodePayloadAgg, error) {
+	pid, did := string(key.ProjectID), string(key.DatabaseID)
+	out := map[string]nodePayloadAgg{}
+
+	for _, t := range nodeTables {
+		// table is a caller-side literal, never user input.
+		rows, err := s.db.QueryContext(ctx,
+			`SELECT node_source, content_hash, schema_ref_hash, timestamp, payload_json
+			   FROM `+t.table+`
+			  WHERE project_id = ? AND database_id = ? AND timestamp GLOB ?
+			  ORDER BY node_source ASC, timestamp DESC, id DESC`,
+			pid, did, readableTS)
+		if err != nil {
+			return nil, err
+		}
+
+		type walkState struct {
+			saw, picked  bool
+			skipped      int
+			corruptTotal int
+			servedAt     time.Time
+		}
+		states := map[string]*walkState{}
+		var order []string
+
+		walk := func() error {
+			defer rows.Close()
+			for rows.Next() {
+				var label, colHash, colRef, tsStr, payload string
+				if err := rows.Scan(&label, &colHash, &colRef, &tsStr, &payload); err != nil {
+					return err
+				}
+				ts, ok := parseHistoryTS(tsStr)
+				if !ok {
+					continue
+				}
+				st, exists := states[label]
+				if !exists {
+					st = &walkState{}
+					states[label] = st
+					order = append(order, label)
+				}
+				st.saw = true
+				bad := true
+				switch t.stream {
+				case "activity":
+					var a schema.ActivityStatsSnapshot
+					if json.Unmarshal([]byte(payload), &a) == nil {
+						bad = a.ContentHash == "" || a.ContentHash != colHash ||
+							a.SchemaRefHash != colRef || a.Node.Source != label
+					}
+				case "query":
+					var q schema.QueryStatsSnapshot
+					if json.Unmarshal([]byte(payload), &q) == nil {
+						bad = q.ContentHash == "" || q.ContentHash != colHash ||
+							q.SchemaRefHash != colRef || q.Node.Source != label
+					}
+				}
+				if bad {
+					st.corruptTotal++
+					if !st.picked {
+						st.skipped++
+					}
+					continue
+				}
+				if !st.picked {
+					st.picked = true
+					st.servedAt = ts
+				}
+			}
+			return rows.Err()
+		}
+		if err := walk(); err != nil {
+			return nil, err
+		}
+
+		for _, label := range order {
+			st := states[label]
+			agg := out[label]
+			agg.corruptRows += st.corruptTotal
+			if st.saw && (!st.picked || st.skipped > 0) {
+				fb := NodeStreamFallback{Stream: t.stream, Skipped: st.skipped}
+				if st.picked {
+					served := st.servedAt
+					fb.ServedAt = &served
+				} else {
+					fb.Unavailable = true
+				}
+				agg.fallback = append(agg.fallback, fb)
+			}
+			out[label] = agg
+		}
+	}
+	return out, nil
 }
 
 func nodeStandbyExpr(prefix string) string {

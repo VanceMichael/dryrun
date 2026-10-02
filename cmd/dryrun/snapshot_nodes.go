@@ -107,6 +107,19 @@ func membersCell(n history.NodeSummary) string {
 }
 
 func printNodeWarnings(nodes []history.NodeSummary) {
+	warnings := nodeWarnings(nodes)
+	if len(warnings) == 0 {
+		return
+	}
+	fmt.Fprintln(os.Stderr)
+	for _, w := range warnings {
+		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+	}
+}
+
+// nodeWarnings builds the operator-facing warnings for one node listing. Pure
+// (no I/O) so the payload-corruption wording can be tested directly.
+func nodeWarnings(nodes []history.NodeSummary) []string {
 	var warnings []string
 	for _, n := range nodes {
 		if n.RoleFlipped {
@@ -139,18 +152,29 @@ func printNodeWarnings(nodes []history.NodeSummary) {
 			warnings = append(warnings, fmt.Sprintf(
 				"%s: unreadable capture timestamp; last capture unknown.", n.Label))
 		}
+		if n.PayloadCorruptRows > 0 && len(n.PayloadFallback) == 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"%s: %d unreadable payload row(s) in history; the newest capture is unaffected.",
+				n.Label, n.PayloadCorruptRows))
+		}
+		for _, fb := range n.PayloadFallback {
+			switch {
+			case fb.Unavailable:
+				warnings = append(warnings, fmt.Sprintf(
+					"%s: %s history is unusable: every stored payload is unreadable; re-capture this node.",
+					n.Label, fb.Stream))
+			case fb.Skipped > 0 && fb.ServedAt != nil:
+				warnings = append(warnings, fmt.Sprintf(
+					"%s: %d newest %s payload(s) unreadable; latest falls back to the capture at %s.",
+					n.Label, fb.Skipped, fb.Stream, fb.ServedAt.Format("2006-01-02 15:04:05")))
+			}
+		}
 		if age := time.Since(n.LastCapture); !n.LastCapture.IsZero() && age > nodeStaleAfter {
 			warnings = append(warnings, fmt.Sprintf(
 				"%s: nothing captured in %d days.", n.Label, int(age.Hours()/24)))
 		}
 	}
-	if len(warnings) == 0 {
-		return
-	}
-	fmt.Fprintln(os.Stderr)
-	for _, w := range warnings {
-		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
-	}
+	return warnings
 }
 
 // " (2026-07-27 .. 2026-07-31)", or a single date when the falls are on one day.

@@ -43,6 +43,9 @@ type (
 		NodeLabel     string       `json:"node_label,omitempty"`
 		ProjectID     *string      `json:"project_id,omitempty"`
 		DatabaseID    *string      `json:"database_id,omitempty"`
+		// the stored payload will not decode or its embedded identity disagrees
+		// with the row columns; latest resolution skips rows like these
+		PayloadCorrupt bool `json:"payload_corrupt,omitempty"`
 	}
 )
 
@@ -532,7 +535,8 @@ func (s *Store) ListSchema(ctx context.Context, key SnapshotKey, rng TimeRange) 
 		sb   strings.Builder
 		args []any
 	)
-	sb.WriteString(`SELECT id, db_url_hash, timestamp, content_hash, database_name, project_id, database_id
+	sb.WriteString(`SELECT id, db_url_hash, timestamp, content_hash, database_name, project_id, database_id,
+	                       CASE WHEN ` + payloadOKExpr("snapshot_json", false, false) + ` THEN 0 ELSE 1 END
 	                  FROM snapshots WHERE project_id = ? AND database_id = ?`)
 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
 	if rng.From != nil {
@@ -553,10 +557,27 @@ func (s *Store) ListSchema(ctx context.Context, key SnapshotKey, rng TimeRange) 
 
 	var out []SnapshotSummary
 	for rows.Next() {
-		ss, err := scanSchemaSummary(rows)
-		if err != nil {
+		var (
+			ss             SnapshotSummary
+			tsStr          string
+			pid, did       sql.NullString
+			payloadCorrupt int
+		)
+		if err := rows.Scan(&ss.ID, &ss.DBURLHash, &tsStr, &ss.ContentHash, &ss.Database, &pid, &did, &payloadCorrupt); err != nil {
 			return nil, err
 		}
+		ss.Kind = SchemaKind()
+		ss.Timestamp, _ = time.Parse(time.RFC3339, tsStr)
+		ss.SchemaRefHash = ss.ContentHash
+		if pid.Valid {
+			v := pid.String
+			ss.ProjectID = &v
+		}
+		if did.Valid {
+			v := did.String
+			ss.DatabaseID = &v
+		}
+		ss.PayloadCorrupt = payloadCorrupt != 0
 		out = append(out, ss)
 	}
 	return out, rows.Err()

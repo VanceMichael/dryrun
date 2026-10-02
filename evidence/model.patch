@@ -1,0 +1,2825 @@
+diff --git a/cmd/dryrun/main.go b/cmd/dryrun/main.go
+index 080ed85..ec73535 100644
+--- a/cmd/dryrun/main.go
++++ b/cmd/dryrun/main.go
+@@ -858,7 +858,13 @@ func mcpServeCmd() *cobra.Command {
+ 				if server.BootstrapFromHistory(context.Background()) {
+ 					t, v, f := server.SchemaCounts()
+ 					fmt.Fprintf(os.Stderr, "dryrun: loaded schema from history.db (%d tables, %d views, %d functions, offline mode)\n", t, v, f)
++					if server.ServedDegraded() {
++						fmt.Fprintln(os.Stderr, "dryrun: warning: the newest history records are unreadable; serving the nearest older valid snapshot (see _meta.history)")
++					}
+ 				} else {
++					if note := server.HistoryLoadError(); note != "" {
++						fmt.Fprintf(os.Stderr, "dryrun: history present but unusable: %s\n", note)
++					}
+ 					fmt.Fprintf(os.Stderr, "dryrun: no schema snapshot in history.db for project=%s database=%s — starting in uninitialized mode\n",
+ 						key.ProjectID, key.DatabaseID)
+ 					fmt.Fprintln(os.Stderr, "dryrun: run 'dryrun init' or 'dryrun snapshot capture'; the snapshot is picked up on the next tool call")
+diff --git a/cmd/dryrun/payload_corruption_e2e_test.go b/cmd/dryrun/payload_corruption_e2e_test.go
+new file mode 100644
+index 0000000..51248a6
+--- /dev/null
++++ b/cmd/dryrun/payload_corruption_e2e_test.go
+@@ -0,0 +1,143 @@
++package main
++
++import (
++	"context"
++	"database/sql"
++	"io"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	_ "modernc.org/sqlite"
++
++	"github.com/boringsql/dryrun/internal/history"
++	"github.com/boringsql/dryrun/internal/schema"
++)
++
++// captureStdoutStderr runs fn with both file descriptors redirected into
++// pipes and returns what was written. The commands under test use fmt.Println
++// directly, not cobra's output writers.
++func captureStdoutStderr(t *testing.T, fn func() error) (string, string, error) {
++	t.Helper()
++	outR, outW, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	errR, errW, err := os.Pipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	prevOut, prevErr := os.Stdout, os.Stderr
++	os.Stdout, os.Stderr = outW, errW
++	runErr := fn()
++	_ = outW.Close()
++	_ = errW.Close()
++	os.Stdout, os.Stderr = prevOut, prevErr
++	out, _ := io.ReadAll(outR)
++	errOut, _ := io.ReadAll(errR)
++	return string(out), string(errOut), runErr
++}
++
++// End to end: a torn newest schema and one node's torn newest activity row are
++// visible in `snapshot list` and `snapshot nodes`, with no payload bytes and
++// no command failure -- the same recovery the MCP server serves on.
++func TestSnapshotListAndNodesReportPayloadCorruption(t *testing.T) {
++	dir := writeTOML(t, t.TempDir(), `
++[project]
++id = "demo"
++`)
++	withCWD(t, dir)
++
++	store, err := history.Open(filepath.Join(dir, ".dryrun", "history.db"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	ctx := context.Background()
++	key := resolveSnapshotKey()
++	t0 := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
++
++	old := &schema.SchemaSnapshot{
++		PgVersion: "PostgreSQL 17.0", Database: "appdb",
++		Timestamp: t0, ContentHash: "h-old",
++		Tables: []schema.Table{{Schema: "public", Name: "users"}},
++	}
++	newer := &schema.SchemaSnapshot{
++		PgVersion: "PostgreSQL 17.0", Database: "appdb",
++		Timestamp: t0.Add(time.Hour), ContentHash: "h-new",
++		Tables: []schema.Table{{Schema: "public", Name: "users"}},
++	}
++	if _, err := store.PutSchema(ctx, key, old); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := store.PutSchema(ctx, key, newer); err != nil {
++		t.Fatal(err)
++	}
++
++	aOld := &schema.ActivityStatsSnapshot{
++		SchemaRefHash: "h-old", ContentHash: "a-old",
++		Node: schema.NodeIdentity{Source: "primary", Timestamp: t0.Add(time.Minute)},
++	}
++	aNew := &schema.ActivityStatsSnapshot{
++		SchemaRefHash: "h-new", ContentHash: "a-new",
++		Node: schema.NodeIdentity{Source: "primary", Timestamp: t0.Add(2 * time.Hour)},
++	}
++	if _, err := store.PutActivity(ctx, key, aOld); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := store.PutActivity(ctx, key, aNew); err != nil {
++		t.Fatal(err)
++	}
++	// torn newest rows, written through a second connection like an
++	// interrupted capture would leave them
++	raw, err := sql.Open("sqlite", "file:"+filepath.Join(dir, ".dryrun", "history.db")+"?_pragma=busy_timeout(5000)")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := raw.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'h-new'`); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := raw.ExecContext(ctx,
++		`UPDATE activity_stats SET payload_json = 'oops' WHERE content_hash = 'a-new'`); err != nil {
++		t.Fatal(err)
++	}
++	if err := raw.Close(); err != nil {
++		t.Fatal(err)
++	}
++	if err := store.Close(); err != nil {
++		t.Fatal(err)
++	}
++
++	// snapshot list: the torn row is marked and the warning names the fallback
++	var historyDB string
++	listOut, listErr, err := captureStdoutStderr(t, func() error {
++		return snapshotListCmd(&historyDB).Execute()
++	})
++	if err != nil {
++		t.Fatalf("list: %v", err)
++	}
++	if !strings.Contains(listOut, "PAYLOAD CORRUPT") {
++		t.Errorf("list output hides the corrupt row:\n%s", listOut)
++	}
++	if !strings.Contains(listErr, "latest serves the nearest older valid record") {
++		t.Errorf("list warning missing:\n%s", listErr)
++	}
++	// damaged bytes must never appear
++	if strings.Contains(listOut, "broken") || strings.Contains(listErr, "broken") {
++		t.Error("corrupt payload content leaked into output")
++	}
++
++	// snapshot nodes: newest primary capture fell back to the older one
++	nodesOut, nodesErr, err := captureStdoutStderr(t, func() error {
++		return snapshotNodesCmd(&historyDB).Execute()
++	})
++	if err != nil {
++		t.Fatalf("nodes: %v", err)
++	}
++	_ = nodesOut
++	if !strings.Contains(nodesErr, "newest activity payload(s) unreadable; latest falls back") {
++		t.Errorf("nodes fallback warning missing:\n%s", nodesErr)
++	}
++}
+diff --git a/cmd/dryrun/payload_corruption_report_test.go b/cmd/dryrun/payload_corruption_report_test.go
+new file mode 100644
+index 0000000..ec86c47
+--- /dev/null
++++ b/cmd/dryrun/payload_corruption_report_test.go
+@@ -0,0 +1,73 @@
++package main
++
++import (
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/boringsql/dryrun/internal/history"
++)
++
++// `snapshot list` must mark torn rows so an operator can see what latest
++// skipped, without printing any of the damaged bytes.
++func TestSnapshotListMarksPayloadCorruption(t *testing.T) {
++	rows := []history.SnapshotSummary{
++		{ContentHash: "good", Kind: history.SchemaKind()},
++		{ContentHash: "bad", Kind: history.SchemaKind(), PayloadCorrupt: true},
++	}
++	if got := countCorruptRows(rows); got != 1 {
++		t.Errorf("countCorruptRows = %d, want 1", got)
++	}
++	if marker := payloadCorruptMarker(rows[0]); marker != "" {
++		t.Errorf("clean row marked: %q", marker)
++	}
++	marker := payloadCorruptMarker(rows[1])
++	if !strings.Contains(marker, "PAYLOAD CORRUPT") {
++		t.Errorf("marker = %q", marker)
++	}
++}
++
++// `snapshot nodes` distinguishes a fallback (older valid capture served) from
++// a fully unavailable node, and says nothing when the newest capture is fine.
++func TestSnapshotNodesWarnsAboutPayloadFallback(t *testing.T) {
++	served := time.Date(2026, 8, 20, 9, 0, 0, 0, time.UTC)
++
++	nodes := []history.NodeSummary{
++		{
++			Label:              "alpha",
++			PayloadCorruptRows: 2,
++			PayloadFallback: []history.NodeStreamFallback{{
++				Stream: "activity", Skipped: 2, ServedAt: &served,
++			}},
++		},
++		{
++			Label:              "beta",
++			PayloadCorruptRows: 1,
++			PayloadFallback: []history.NodeStreamFallback{{
++				Stream: "query", Unavailable: true, Skipped: 1,
++			}},
++		},
++		{
++			Label:              "gamma",
++			PayloadCorruptRows: 1,
++		},
++	}
++	warnings := nodeWarnings(nodes)
++	joined := strings.Join(warnings, "\n")
++
++	if !strings.Contains(joined, "alpha: 2 newest activity payload(s) unreadable; latest falls back") ||
++		!strings.Contains(joined, "2026-08-20 09:00:00") {
++		t.Errorf("fallback warning missing/wrong:\n%s", joined)
++	}
++	if !strings.Contains(joined, "beta: query history is unusable: every stored payload is unreadable") {
++		t.Errorf("unavailable warning missing:\n%s", joined)
++	}
++	if !strings.Contains(joined, "gamma: 1 unreadable payload row(s) in history; the newest capture is unaffected") {
++		t.Errorf("clean-newest warning missing:\n%s", joined)
++	}
++
++	// a healthy node produces no payload warnings
++	if ws := nodeWarnings([]history.NodeSummary{{Label: "delta", Role: history.NodeRolePrimary}}); len(ws) != 0 {
++		t.Errorf("healthy node warned: %v", ws)
++	}
++}
+diff --git a/cmd/dryrun/snapshot_list.go b/cmd/dryrun/snapshot_list.go
+index d65e563..852eca1 100644
+--- a/cmd/dryrun/snapshot_list.go
++++ b/cmd/dryrun/snapshot_list.go
+@@ -2,6 +2,7 @@ package main
+ 
+ import (
+ 	"fmt"
++	"os"
+ 	"sort"
+ 	"strings"
+ 
+@@ -79,13 +80,16 @@ func snapshotListCmd(historyDB *string) *cobra.Command {
+ 				}
+ 			}
+ 			for _, s := range shown {
+-				hash := s.ContentHash
+-				if len(hash) > 16 {
+-					hash = hash[:16]
+-				}
+-				fmt.Printf("%s  %-*s  %s  %s\n",
+-					s.Timestamp.Format("2006-01-02 15:04:05"),
+-					typeW, s.Kind.String(), hash, s.Database)
++			hash := s.ContentHash
++			if len(hash) > 16 {
++				hash = hash[:16]
++			}
++			fmt.Printf("%s  %-*s  %s  %s%s\n",
++				s.Timestamp.Format("2006-01-02 15:04:05"),
++				typeW, s.Kind.String(), hash, s.Database, payloadCorruptMarker(s))
++		}
++			if corrupt := countCorruptRows(shown); corrupt > 0 {
++				fmt.Fprintf(os.Stderr, "\nwarning: %d snapshot row(s) have an unreadable payload; latest serves the nearest older valid record\n", corrupt)
+ 			}
+ 			if len(shown) < total {
+ 				fmt.Printf("\n%d of %d snapshot(s) (--limit %d)\n", len(shown), total, limit)
+@@ -104,6 +108,27 @@ func snapshotListCmd(historyDB *string) *cobra.Command {
+ 	return cmd
+ }
+ 
++// countCorruptRows counts listed rows whose payload cannot be decoded or
++// whose embedded identity disagrees with its columns.
++func countCorruptRows(summaries []history.SnapshotSummary) int {
++	n := 0
++	for i := range summaries {
++		if summaries[i].PayloadCorrupt {
++			n++
++		}
++	}
++	return n
++}
++
++// payloadCorruptMarker flags a row tolerant latest skips. It carries the
++// fact, never the damaged bytes.
++func payloadCorruptMarker(s history.SnapshotSummary) string {
++	if s.PayloadCorrupt {
++		return "  PAYLOAD CORRUPT (latest skips this record)"
++	}
++	return ""
++}
++
+ // Newest first. Timestamps are second-resolution and `capture --all` writes a
+ // whole fleet inside one second, so ties need a deterministic order or
+ // --limit returns a different slice each run.
+diff --git a/cmd/dryrun/snapshot_nodes.go b/cmd/dryrun/snapshot_nodes.go
+index 529d39b..dbb5598 100644
+--- a/cmd/dryrun/snapshot_nodes.go
++++ b/cmd/dryrun/snapshot_nodes.go
+@@ -107,6 +107,19 @@ func membersCell(n history.NodeSummary) string {
+ }
+ 
+ func printNodeWarnings(nodes []history.NodeSummary) {
++	warnings := nodeWarnings(nodes)
++	if len(warnings) == 0 {
++		return
++	}
++	fmt.Fprintln(os.Stderr)
++	for _, w := range warnings {
++		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
++	}
++}
++
++// nodeWarnings builds the operator-facing warnings for one node listing. Pure
++// (no I/O) so the payload-corruption wording can be tested directly.
++func nodeWarnings(nodes []history.NodeSummary) []string {
+ 	var warnings []string
+ 	for _, n := range nodes {
+ 		if n.RoleFlipped {
+@@ -139,18 +152,29 @@ func printNodeWarnings(nodes []history.NodeSummary) {
+ 			warnings = append(warnings, fmt.Sprintf(
+ 				"%s: unreadable capture timestamp; last capture unknown.", n.Label))
+ 		}
++		if n.PayloadCorruptRows > 0 && len(n.PayloadFallback) == 0 {
++			warnings = append(warnings, fmt.Sprintf(
++				"%s: %d unreadable payload row(s) in history; the newest capture is unaffected.",
++				n.Label, n.PayloadCorruptRows))
++		}
++		for _, fb := range n.PayloadFallback {
++			switch {
++			case fb.Unavailable:
++				warnings = append(warnings, fmt.Sprintf(
++					"%s: %s history is unusable: every stored payload is unreadable; re-capture this node.",
++					n.Label, fb.Stream))
++			case fb.Skipped > 0 && fb.ServedAt != nil:
++				warnings = append(warnings, fmt.Sprintf(
++					"%s: %d newest %s payload(s) unreadable; latest falls back to the capture at %s.",
++					n.Label, fb.Skipped, fb.Stream, fb.ServedAt.Format("2006-01-02 15:04:05")))
++			}
++		}
+ 		if age := time.Since(n.LastCapture); !n.LastCapture.IsZero() && age > nodeStaleAfter {
+ 			warnings = append(warnings, fmt.Sprintf(
+ 				"%s: nothing captured in %d days.", n.Label, int(age.Hours()/24)))
+ 		}
+ 	}
+-	if len(warnings) == 0 {
+-		return
+-	}
+-	fmt.Fprintln(os.Stderr)
+-	for _, w := range warnings {
+-		fmt.Fprintf(os.Stderr, "warning: %s\n", w)
+-	}
++	return warnings
+ }
+ 
+ // " (2026-07-27 .. 2026-07-31)", or a single date when the falls are on one day.
+diff --git a/internal/history/fallback.go b/internal/history/fallback.go
+new file mode 100644
+index 0000000..15515d7
+--- /dev/null
++++ b/internal/history/fallback.go
+@@ -0,0 +1,419 @@
++package history
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"log/slog"
++
++	"github.com/boringsql/dryrun/internal/schema"
++)
++
++// ErrHistoryCorrupt marks a latest resolution that found stored rows but no
++// decodable, internally consistent predecessor in a required range. Explicit
++// refs (content hash, latest~N, point in time) never wrap this: they fail
++// against the one record they named.
++var ErrHistoryCorrupt = errors.New("corrupt history payload")
++
++type (
++	// NodeFallback is the content-free report for one node of a node-scoped
++	// stream during tolerant latest assembly: how many unusable newest rows
++	// were skipped, and why the node is unavailable when no valid row remained.
++	// It never carries payload bytes.
++	NodeFallback struct {
++		Node    string `json:"node"`
++		Skipped int    `json:"skipped_payloads,omitempty"`
++		// set when the node had rows in the required range but every one was
++		// unusable, so the bundle serves nothing for this node rather than
++		// pretending the stream was never captured
++		Reason string `json:"unavailable_reason,omitempty"`
++	}
++
++	// StreamFallback reports what latest resolution skipped for one stream.
++	// Planner/schema use Skipped/Reason; node-scoped streams detail each
++	// affected node in Nodes.
++	StreamFallback struct {
++		Stream  string         `json:"stream"`
++		Skipped int            `json:"skipped_payloads,omitempty"`
++		Reason  string         `json:"unavailable_reason,omitempty"`
++		Nodes   []NodeFallback `json:"nodes,omitempty"`
++	}
++
++	// LatestRecovery is the audit trail of one tolerant latest assembly.
++	// ServedSchemaHash names the generation the bundle was actually bound to;
++	// Streams lists only streams that did not serve their newest row cleanly.
++	LatestRecovery struct {
++		ServedSchemaHash string
++		Streams          []StreamFallback
++	}
++)
++
++func (f StreamFallback) degraded() bool {
++	return f.Skipped > 0 || f.Reason != "" || len(f.Nodes) > 0
++}
++
++// Degraded reports whether the assembly skipped anything: schema fallback,
++// planner fallback, per-node activity/query fallback, or an unavailable range.
++func (r LatestRecovery) Degraded() bool {
++	for i := range r.Streams {
++		if r.Streams[i].degraded() {
++			return true
++		}
++	}
++	return false
++}
++
++// SkippedPayloads totals skipped payload rows across every stream and node.
++func (r LatestRecovery) SkippedPayloads() int {
++	n := 0
++	for i := range r.Streams {
++		n += r.Streams[i].Skipped
++		for j := range r.Streams[i].Nodes {
++			n += r.Streams[i].Nodes[j].Skipped
++		}
++	}
++	return n
++}
++
++// GetAnnotatedLatest is the corruption-tolerant assembly behind an unqualified
++// "latest". It walks every stream newest-to-oldest and serves the nearest
++// record that decodes AND whose embedded identity matches the row columns:
++//
++//   - schema first; the schema generation actually found binds every other
++//     stream, so stats from a newer corrupt schema (or any other generation)
++//     can never be spliced in;
++//   - planner: the newest valid row bound to that schema_ref_hash;
++//   - activity and query: the newest valid row independently PER NODE under
++//     that hash, so one node's torn write never blanks the others.
++//
++// When no valid predecessor exists in a required range the returned report
++// carries an explicit reason and, for the schema itself, GetAnnotatedLatest
++// fails with ErrHistoryCorrupt rather than serving an empty bundle.
++func (s *Store) GetAnnotatedLatest(ctx context.Context, key SnapshotKey) (*schema.AnnotatedSchema, LatestRecovery, error) {
++	pid, did := string(key.ProjectID), string(key.DatabaseID)
++	rec := LatestRecovery{}
++
++	snap, schemaFB, err := s.latestValidSchema(ctx, pid, did)
++	if err != nil {
++		if schemaFB.degraded() {
++			// carry the skip count even though there is nothing to serve
++			rec.Streams = append(rec.Streams, schemaFB)
++		}
++		return nil, rec, err
++	}
++	rec.ServedSchemaHash = snap.ContentHash
++	if schemaFB.degraded() {
++		rec.Streams = append(rec.Streams, schemaFB)
++	}
++
++	planner, plannerFB, err := s.latestValidPlannerRow(ctx, pid, did, snap.ContentHash)
++	if err != nil {
++		return nil, rec, err
++	}
++	if plannerFB.degraded() {
++		rec.Streams = append(rec.Streams, plannerFB)
++	}
++
++	acts, activityFB, err := scanLatestValidNodeRows[schema.ActivityStatsSnapshot](
++		ctx, s.db, "activity_stats", "activity", pid, did, snap.ContentHash,
++		func(a *schema.ActivityStatsSnapshot, contentHash, schemaRef, node string) bool {
++			return a.ContentHash != "" && a.ContentHash == contentHash &&
++				a.SchemaRefHash == schemaRef && a.Node.Source == node
++		})
++	if err != nil {
++		return nil, rec, err
++	}
++	if activityFB.degraded() {
++		rec.Streams = append(rec.Streams, activityFB)
++	}
++
++	qs, queryFB, err := scanLatestValidNodeRows[schema.QueryStatsSnapshot](
++		ctx, s.db, "query_stats", "query", pid, did, snap.ContentHash,
++		func(q *schema.QueryStatsSnapshot, contentHash, schemaRef, node string) bool {
++			return q.ContentHash != "" && q.ContentHash == contentHash &&
++				q.SchemaRefHash == schemaRef && q.Node.Source == node
++		})
++	if err != nil {
++		return nil, rec, err
++	}
++	if queryFB.degraded() {
++		rec.Streams = append(rec.Streams, queryFB)
++	}
++
++	out := &schema.AnnotatedSchema{Schema: snap}
++	if planner != nil {
++		out.Planner = schema.RollUpPartitionSizing(snap, planner)
++	}
++	nodes, err := s.joinActivityNodes(ctx, key, snap, acts)
++	if err != nil {
++		return nil, rec, err
++	}
++	if len(nodes) > 0 {
++		out.Merged = &schema.MergedActivity{Nodes: nodes}
++	}
++	out.QueryStats = qs
++	return out, rec, nil
++}
++
++// latestValidSchema walks schema rows newest-first and returns the first that
++// decodes into a snapshot whose embedded content hash matches the row column.
++// A mismatched identity means the bytes belong to another record and is as
++// unusable as one that will not parse.
++func (s *Store) latestValidSchema(ctx context.Context, pid, did string) (*schema.SchemaSnapshot, StreamFallback, error) {
++	fb := StreamFallback{Stream: "schema"}
++	rows, err := s.db.QueryContext(ctx,
++		`SELECT content_hash, snapshot_json FROM snapshots
++		  WHERE project_id = ? AND database_id = ?
++		  ORDER BY timestamp DESC, id DESC`,
++		pid, did)
++	if err != nil {
++		return nil, fb, err
++	}
++	defer rows.Close()
++
++	sawRow := false
++	for rows.Next() {
++		var colHash, payload string
++		if err := rows.Scan(&colHash, &payload); err != nil {
++			return nil, fb, err
++		}
++		sawRow = true
++		var snap schema.SchemaSnapshot
++		if json.Unmarshal([]byte(payload), &snap) != nil ||
++			snap.ContentHash == "" || snap.ContentHash != colHash {
++			fb.Skipped++
++			continue
++		}
++		return &snap, fb, nil
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fb, err
++	}
++	if !sawRow {
++		return nil, fb, fmt.Errorf("%w (latest schema for project=%s database=%s)",
++			ErrSnapshotNotFound, pid, did)
++	}
++	fb.Reason = fmt.Sprintf(
++		"no readable schema snapshot; skipped %d unusable newest row(s); recapture required",
++		fb.Skipped)
++	return nil, fb, fmt.Errorf("%w: project=%s database=%s: %s",
++		ErrHistoryCorrupt, pid, did, fb.Reason)
++}
++
++// latestValidPlannerRow walks planner rows newest-first. schemaRef "" means
++// unscoped (a payload is checked against its row's schema_ref_hash column).
++// No rows at all is the ordinary "planner not captured yet" absence; rows
++// present but every one unusable is reported as an unavailable range instead.
++func (s *Store) latestValidPlannerRow(ctx context.Context, pid, did, schemaRef string) (*schema.PlannerStatsSnapshot, StreamFallback, error) {
++	fb := StreamFallback{Stream: "planner"}
++	query := `SELECT content_hash, schema_ref_hash, payload_json FROM planner_stats
++		  WHERE project_id = ? AND database_id = ?`
++	args := []any{pid, did}
++	if schemaRef != "" {
++		query += ` AND schema_ref_hash = ?`
++		args = append(args, schemaRef)
++	}
++	query += ` ORDER BY timestamp DESC, id DESC`
++	rows, err := s.db.QueryContext(ctx, query, args...)
++	if err != nil {
++		return nil, fb, err
++	}
++	defer rows.Close()
++
++	sawRow := false
++	for rows.Next() {
++		var colHash, colRef, payload string
++		if err := rows.Scan(&colHash, &colRef, &payload); err != nil {
++			return nil, fb, err
++		}
++		sawRow = true
++		var p schema.PlannerStatsSnapshot
++		if json.Unmarshal([]byte(payload), &p) != nil ||
++			p.ContentHash == "" || p.ContentHash != colHash || p.SchemaRefHash != colRef {
++			fb.Skipped++
++			continue
++		}
++		if schemaRef != "" && p.SchemaRefHash != schemaRef {
++			fb.Skipped++
++			continue
++		}
++		return &p, fb, nil
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fb, err
++	}
++	if !sawRow {
++		// never bound: not corruption, nothing to report
++		return nil, StreamFallback{}, nil
++	}
++	if schemaRef != "" {
++		fb.Reason = fmt.Sprintf(
++			"every planner payload bound to schema %s is unreadable; skipped %d row(s)",
++			schemaRef, fb.Skipped)
++	} else {
++		fb.Reason = fmt.Sprintf(
++			"every planner payload is unreadable; skipped %d row(s)", fb.Skipped)
++	}
++	return nil, fb, nil
++}
++
++// latestValidNodeStatRow walks one node table newest-first and returns the
++// first decodable, identity-consistent row. nodeLabel "" spans every node and
++// schemaRef "" spans every generation. saw==false means no row matched at all.
++func latestValidNodeStatRow[T any](
++	ctx context.Context, db *sql.DB, table, pid, did, nodeLabel, schemaRef string,
++	check func(v *T, contentHash, schemaRefHash, node string) bool,
++) (*T, int, bool, error) {
++	query := `SELECT node_source, content_hash, schema_ref_hash, payload_json FROM ` + table + `
++		  WHERE project_id = ? AND database_id = ?`
++	args := []any{pid, did}
++	if nodeLabel != "" {
++		query += ` AND node_source = ?`
++		args = append(args, nodeLabel)
++	}
++	if schemaRef != "" {
++		query += ` AND schema_ref_hash = ?`
++		args = append(args, schemaRef)
++	}
++	query += ` ORDER BY timestamp DESC, id DESC`
++	rows, err := db.QueryContext(ctx, query, args...)
++	if err != nil {
++		return nil, 0, false, err
++	}
++	defer rows.Close()
++
++	saw := false
++	skipped := 0
++	for rows.Next() {
++		var node, colHash, colRef, payload string
++		if err := rows.Scan(&node, &colHash, &colRef, &payload); err != nil {
++			return nil, skipped, saw, err
++		}
++		saw = true
++		var v T
++		if json.Unmarshal([]byte(payload), &v) != nil || !check(&v, colHash, colRef, node) {
++			skipped++
++			continue
++		}
++		if schemaRef != "" && colRef != schemaRef {
++			skipped++
++			continue
++		}
++		return &v, skipped, saw, nil
++	}
++	return nil, skipped, saw, rows.Err()
++}
++
++// scanLatestValidNodeRows is the per-node fallback core for activity_stats and
++// query_stats. Rows arrive newest-first per node_source; the first valid row
++// for a node is what it serves, and anything newer that was skipped is that
++// node's fallback count. A node whose rows are all unusable gets a reason
++// instead of vanishing. schemaRef "" means unscoped: a payload is checked
++// against its own row's schema_ref_hash column rather than one generation.
++// Generic over the concrete snapshot type; it is a free function because Go
++// methods cannot declare type parameters.
++func scanLatestValidNodeRows[T any](
++	ctx context.Context, db *sql.DB, table, stream, pid, did, schemaRef string,
++	check func(v *T, contentHash, schemaRefHash, node string) bool,
++) ([]T, StreamFallback, error) {
++	fb := StreamFallback{Stream: stream}
++	// table is a caller-side literal, never user input.
++	query := `SELECT node_source, content_hash, schema_ref_hash, payload_json FROM ` + table + `
++		  WHERE project_id = ? AND database_id = ?`
++	args := []any{pid, did}
++	if schemaRef != "" {
++		query += ` AND schema_ref_hash = ?`
++		args = append(args, schemaRef)
++	}
++	query += ` ORDER BY node_source ASC, timestamp DESC, id DESC`
++	rows, err := db.QueryContext(ctx, query, args...)
++	if err != nil {
++		return nil, fb, err
++	}
++	defer rows.Close()
++
++	type nodeState struct {
++		picked  bool
++		saw     bool
++		skipped int
++	}
++	states := map[string]*nodeState{}
++	var order []string
++	var out []T
++
++	for rows.Next() {
++		var node, colHash, colRef, payload string
++		if err := rows.Scan(&node, &colHash, &colRef, &payload); err != nil {
++			return nil, fb, err
++		}
++		st, ok := states[node]
++		if !ok {
++			st = &nodeState{}
++			states[node] = st
++			order = append(order, node)
++		}
++		st.saw = true
++		if st.picked {
++			continue
++		}
++		var v T
++		if json.Unmarshal([]byte(payload), &v) != nil || !check(&v, colHash, colRef, node) {
++			st.skipped++
++			continue
++		}
++		st.picked = true
++		out = append(out, v)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, fb, err
++	}
++
++	fb.Skipped = 0
++	for _, label := range order {
++		st := states[label]
++		fb.Skipped += st.skipped
++		if st.skipped == 0 && st.picked {
++			continue
++		}
++		nf := NodeFallback{Node: label, Skipped: st.skipped}
++		if !st.picked {
++			if schemaRef != "" {
++				nf.Reason = fmt.Sprintf(
++					"every %s payload for node %q bound to schema %s is unreadable",
++					stream, label, schemaRef)
++			} else {
++				nf.Reason = fmt.Sprintf(
++					"every %s payload for node %q is unreadable", stream, label)
++			}
++		}
++		fb.Nodes = append(fb.Nodes, nf)
++	}
++	return out, fb, nil
++}
++
++// joinActivityNodes mirrors GetAnnotated's merge: newest row per label first,
++// then the other members of an oscillating pool label, partition rollups
++// applied to every entry. Best-effort member lookups never drop the label.
++func (s *Store) joinActivityNodes(ctx context.Context, key SnapshotKey, snap *schema.SchemaSnapshot, acts []schema.ActivityStatsSnapshot) ([]schema.NodeActivity, error) {
++	var nodes []schema.NodeActivity
++	add := func(r schema.ActivityStatsSnapshot) {
++		tables, indexes := schema.RollUpPartitionActivity(snap, r.Tables, r.Indexes)
++		nodes = append(nodes, schema.NodeActivity{Node: r.Node, Tables: tables, Indexes: indexes})
++	}
++	for i := range acts {
++		members, err := s.activityMembers(ctx, key, snap.ContentHash, acts[i])
++		if err != nil {
++			if ctxErr(err) {
++				return nil, err
++			}
++			slog.Debug("pool servers unavailable; label keeps its newest row", "node", acts[i].Node.Source, "error", err)
++		}
++		add(acts[i])
++		for _, m := range members {
++			add(m)
++		}
++	}
++	return nodes, nil
++}
+diff --git a/internal/history/fallback_test.go b/internal/history/fallback_test.go
+new file mode 100644
+index 0000000..cef13b8
+--- /dev/null
++++ b/internal/history/fallback_test.go
+@@ -0,0 +1,598 @@
++package history
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++)
++
++func streamRecovery(rec LatestRecovery, stream string) (StreamFallback, bool) {
++	for _, f := range rec.Streams {
++		if f.Stream == stream {
++			return f, true
++		}
++	}
++	return StreamFallback{}, false
++}
++
++func nodeRecovery(fb StreamFallback, node string) (NodeFallback, bool) {
++	for _, n := range fb.Nodes {
++		if n.Node == node {
++			return n, true
++		}
++	}
++	return NodeFallback{}, false
++}
++
++func putActivityRef(t *testing.T, s *Store, k SnapshotKey, schemaRef, hash, label string, ts time.Time) {
++	t.Helper()
++	a := activityFixture(schemaRef, hash, label, false)
++	a.Node.Timestamp = ts
++	if _, err := s.PutActivity(context.Background(), k, a); err != nil {
++		t.Fatalf("PutActivity %s: %v", hash, err)
++	}
++}
++
++func putQueryRef(t *testing.T, s *Store, k SnapshotKey, schemaRef, hash, label string, ts time.Time) {
++	t.Helper()
++	q := queryStatsFixture(schemaRef, hash, label)
++	q.Node.Timestamp = ts
++	if _, err := s.PutQueryStats(context.Background(), k, q); err != nil {
++		t.Fatalf("PutQueryStats %s: %v", hash, err)
++	}
++}
++
++// A torn write to the newest schema row must not blank offline tools: latest
++// serves the nearest older decodable schema and reports the skip.
++func TestLatest_SchemaFallbackToOlderValid(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h-old", base)
++	putSchemaAt(t, s, k, "h-new", base.Add(time.Hour))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'h-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatalf("GetAnnotatedLatest: %v", err)
++	}
++	if a.Schema.ContentHash != "h-old" {
++		t.Fatalf("want h-old served, got %q", a.Schema.ContentHash)
++	}
++	fb, ok := streamRecovery(rec, "schema")
++	if !ok || fb.Skipped != 1 {
++		t.Fatalf("schema recovery = %+v ok=%v", fb, ok)
++	}
++	if rec.ServedSchemaHash != "h-old" {
++		t.Fatalf("ServedSchemaHash = %q", rec.ServedSchemaHash)
++	}
++
++	// the tolerant wrapper used by every latest caller serves the same bundle
++	got, err := s.GetAnnotated(ctx, k, NewRefLatest())
++	if err != nil || got.Schema.ContentHash != "h-old" {
++		t.Fatalf("GetAnnotated(latest) = %+v, %v", got, err)
++	}
++}
++
++// The strict addressing paths name one record and must fail against it even
++// though latest would skip the same bytes.
++func TestLatest_ExplicitRefsFailOnTheCorruptRecord(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h-old", base)
++	putSchemaAt(t, s, k, "h-new", base.Add(time.Hour))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'h-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	for name, ref := range map[string]SnapshotRef{
++		"hash":   NewRefHash("h-new"),
++		"index0": NewRefIndex(0),
++		"attime": NewRefAt(base.Add(2 * time.Hour)),
++	} {
++		if _, err := s.GetSchema(ctx, k, ref); err == nil {
++			t.Errorf("%s: corrupt record served instead of erroring", name)
++		} else if !errors.Is(err, ErrSnapshotNotFound) && !strings.Contains(err.Error(), "corrupt") {
++			t.Errorf("%s: error should name the corrupt record: %v", name, err)
++		}
++	}
++
++	// GetAnnotated with an explicit point in time stays strict too
++	if _, err := s.GetAnnotated(ctx, k, NewRefAt(base.Add(2*time.Hour))); err == nil {
++		t.Error("GetAnnotated(at) silently fell back")
++	}
++	// the older record is still explicitly addressable
++	if snap, err := s.GetSchema(ctx, k, NewRefHash("h-old")); err != nil || snap.ContentHash != "h-old" {
++		t.Fatalf("h-old not addressable: snap=%+v err=%v", snap, err)
++	}
++}
++
++// NewRefAt constructor for the strict-ref test above.
++func NewRefAt(at time.Time) SnapshotRef { return SnapshotRef{Kind: RefAt, At: at} }
++
++// When the schema falls back a generation, stats bound to the corrupt newer
++// schema must never be spliced in: every stream is scoped to the served hash.
++func TestLatest_StatsStayInsideTheServedSchemaGeneration(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-3 * time.Hour)
++
++	putSchemaAt(t, s, k, "h-old", base)
++	putPlannerAt(t, s, k, "h-old", "p-old", base.Add(time.Minute))
++	putActivityRef(t, s, k, "h-old", "a-old", "primary", base.Add(time.Minute))
++
++	putSchemaAt(t, s, k, "h-new", base.Add(time.Hour))
++	// valid stats for the corrupt generation -- they must stay out
++	putPlannerAt(t, s, k, "h-new", "p-new", base.Add(time.Hour+time.Minute))
++	putActivityRef(t, s, k, "h-new", "a-new", "primary", base.Add(time.Hour+time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'h-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, _, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Planner == nil || a.Planner.ContentHash != "p-old" {
++		t.Fatalf("planner leaked across generations: %+v", a.Planner)
++	}
++	if a.Merged == nil || len(a.Merged.Nodes) != 1 {
++		t.Fatalf("activity merge = %+v", a.Merged)
++	}
++	for _, n := range a.Merged.Nodes {
++		if !n.Node.Timestamp.Equal(base.Add(time.Minute)) {
++			t.Errorf("new-generation activity spliced in: %s", n.Node.Timestamp)
++		}
++	}
++}
++
++// Planner picks the newest VALID row inside the served hash's range.
++func TestLatest_PlannerFallsBackInsideRange(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	putPlannerAt(t, s, k, "h1", "p-old", base.Add(time.Minute))
++	putPlannerAt(t, s, k, "h1", "p-new", base.Add(2*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE planner_stats SET payload_json = 'oops' WHERE content_hash = 'p-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Planner == nil || a.Planner.ContentHash != "p-old" {
++		t.Fatalf("want p-old, got %+v", a.Planner)
++	}
++	fb, ok := streamRecovery(rec, "planner")
++	if !ok || fb.Skipped != 1 {
++		t.Fatalf("planner recovery = %+v", fb)
++	}
++
++	// every planner row unusable: a named unavailable range, not "uncaptured"
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE planner_stats SET payload_json = 'oops'`); err != nil {
++		t.Fatal(err)
++	}
++	a2, rec2, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a2.Planner != nil {
++		t.Fatalf("no valid planner row must serve: %+v", a2.Planner)
++	}
++	fb2, _ := streamRecovery(rec2, "planner")
++	if fb2.Reason == "" {
++		t.Fatalf("want an unavailable reason, got %+v", fb2)
++	}
++}
++
++// One node's bad newest row falls back to its own older row; other nodes keep
++// their newest capture.
++func TestLatest_ActivityFallbackIsIndependentPerNode(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	putActivityRef(t, s, k, "h1", "a-good", "alpha", base.Add(time.Minute))
++	putActivityRef(t, s, k, "h1", "b-old", "beta", base.Add(2*time.Minute))
++	putActivityRef(t, s, k, "h1", "b-new", "beta", base.Add(3*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE activity_stats SET payload_json = 'oops' WHERE content_hash = 'b-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Merged == nil || len(a.Merged.Nodes) != 2 {
++		t.Fatalf("want both nodes, got %+v", a.Merged)
++	}
++	byNode := map[string]time.Time{}
++	for _, n := range a.Merged.Nodes {
++		byNode[n.Node.Source] = n.Node.Timestamp
++	}
++	if !byNode["alpha"].Equal(base.Add(time.Minute)) {
++		t.Errorf("alpha moved: %s", byNode["alpha"])
++	}
++	if !byNode["beta"].Equal(base.Add(2 * time.Minute)) {
++		t.Errorf("beta should fall back to b-old, got %s", byNode["beta"])
++	}
++	fb, ok := streamRecovery(rec, "activity")
++	if !ok {
++		t.Fatal("no activity recovery reported")
++	}
++	nf, ok := nodeRecovery(fb, "beta")
++	if !ok || nf.Skipped != 1 || nf.Reason != "" {
++		t.Fatalf("beta recovery = %+v", nf)
++	}
++	if _, reported := nodeRecovery(fb, "alpha"); reported {
++		t.Error("alpha was clean and must not be reported")
++	}
++}
++
++// A node whose every row in the required range is unusable is named
++// unavailable without taking the other nodes down with it.
++func TestLatest_NodeFullyCorruptStaysUnavailable(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	putActivityRef(t, s, k, "h1", "a-good", "alpha", base.Add(time.Minute))
++	putActivityRef(t, s, k, "h1", "b-1", "beta", base.Add(2*time.Minute))
++	putActivityRef(t, s, k, "h1", "b-2", "beta", base.Add(3*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE activity_stats SET payload_json = 'oops' WHERE node_source = 'beta'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Merged == nil || len(a.Merged.Nodes) != 1 || a.Merged.Nodes[0].Node.Source != "alpha" {
++		t.Fatalf("only alpha should serve, got %+v", a.Merged)
++	}
++	fb, _ := streamRecovery(rec, "activity")
++	nf, ok := nodeRecovery(fb, "beta")
++	if !ok || nf.Reason == "" || nf.Skipped != 2 {
++		t.Fatalf("beta unavailable reason = %+v", nf)
++	}
++}
++
++// Query stats follow the same per-node rule.
++func TestLatest_QueryFallbackIsIndependentPerNode(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	putQueryRef(t, s, k, "h1", "q-good", "alpha", base.Add(time.Minute))
++	putQueryRef(t, s, k, "h1", "q-old", "beta", base.Add(2*time.Minute))
++	putQueryRef(t, s, k, "h1", "q-new", "beta", base.Add(3*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE query_stats SET payload_json = 'oops' WHERE content_hash = 'q-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(a.QueryStats) != 2 {
++		t.Fatalf("want both query nodes, got %d", len(a.QueryStats))
++	}
++	fb, ok := streamRecovery(rec, "query")
++	if !ok {
++		t.Fatal("no query recovery")
++	}
++	nf, ok := nodeRecovery(fb, "beta")
++	if !ok || nf.Skipped != 1 {
++		t.Fatalf("beta query recovery = %+v", nf)
++	}
++}
++
++// Every schema row unusable: an explicit corruption error naming the range,
++// not ErrSnapshotNotFound's "nothing captured".
++func TestLatest_AllSchemaCorruptReturnsExplicitReason(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = 'oops'`); err != nil {
++		t.Fatal(err)
++	}
++
++	_, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if !errors.Is(err, ErrHistoryCorrupt) {
++		t.Fatalf("want ErrHistoryCorrupt, got %v", err)
++	}
++	fb, ok := streamRecovery(rec, "schema")
++	if !ok || fb.Skipped != 1 || fb.Reason == "" {
++		t.Fatalf("recovery = %+v", rec.Streams)
++	}
++
++	// nothing stored at all stays the ordinary not-found
++	empty := testStore(t)
++	if _, _, err := empty.GetAnnotatedLatest(context.Background(), k); !errors.Is(err, ErrSnapshotNotFound) {
++		t.Fatalf("empty store: want ErrSnapshotNotFound, got %v", err)
++	}
++}
++
++// Valid JSON whose embedded identity disagrees with the row columns is a
++// different record's bytes and must be skipped just like malformed JSON.
++func TestLatest_IdentityMismatchIsCorruption(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h-old", base)
++	putSchemaAt(t, s, k, "h-new", base.Add(time.Hour))
++	// valid JSON, but the digest inside belongs to another row
++	good, err := json.Marshal(testSnapshot("h-old", "acme"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = ? WHERE content_hash = 'h-new'`, string(good)); err != nil {
++		t.Fatal(err)
++	}
++
++	a, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Schema.ContentHash != "h-old" {
++		t.Fatalf("identity-mismatched row served: %q", a.Schema.ContentHash)
++	}
++	if fb, _ := streamRecovery(rec, "schema"); fb.Skipped != 1 {
++		t.Fatalf("want 1 skipped, got %+v", fb)
++	}
++}
++
++// Pulled rows (captured_locally = 0) are still valid predecessors: a corrupt
++// local newest row falls back onto a pulled older one.
++func TestLatest_FallbackCanUsePulledRows(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	// simulate a pulled planner row
++	p := plannerFixture("h1", "p-pulled", "acme")
++	p.Timestamp = base.Add(time.Minute)
++	if _, err := s.Put(ctx, k, WrapPlanner(p)); err != nil {
++		t.Fatal(err)
++	}
++	putPlannerAt(t, s, k, "h1", "p-local", base.Add(2*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE planner_stats SET payload_json = 'oops' WHERE content_hash = 'p-local'`); err != nil {
++		t.Fatal(err)
++	}
++
++	a, _, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Planner == nil || a.Planner.ContentHash != "p-pulled" {
++		t.Fatalf("pulled predecessor not used: %+v", a.Planner)
++	}
++}
++
++// Inventory and List surface payload corruption as counts/markers.
++func TestLatest_PayloadCorruptionSurfacedInInventoryAndList(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h-old", base)
++	putSchemaAt(t, s, k, "h-new", base.Add(time.Hour))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = 'oops' WHERE content_hash = 'h-new'`); err != nil {
++		t.Fatal(err)
++	}
++	putActivityRef(t, s, k, "h-old", "a1", "primary", base)
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE activity_stats SET payload_json = 'oops' WHERE content_hash = 'a1'`); err != nil {
++		t.Fatal(err)
++	}
++
++	spans, err := s.Inventory(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := map[string]int{"schema": 1, "activity": 1}
++	for _, sp := range spans {
++		if got := sp.PayloadCorruptRows; got != want[sp.Stream] {
++			t.Errorf("stream %s payload_corrupt_rows = %d, want %d", sp.Stream, got, want[sp.Stream])
++		}
++	}
++
++	list, err := s.List(ctx, k, SchemaKind(), TimeRange{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	var marked int
++	for _, row := range list {
++		if row.PayloadCorrupt {
++			marked++
++			if row.ContentHash != "h-new" {
++				t.Errorf("wrong row marked: %s", row.ContentHash)
++			}
++		}
++	}
++	if marked != 1 {
++		t.Fatalf("want 1 marked row, got %d", marked)
++	}
++
++	nodes, err := s.ListNodes(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(nodes) != 1 || nodes[0].Label != "primary" || nodes[0].PayloadCorruptRows != 1 {
++		t.Fatalf("node summary = %+v", nodes)
++	}
++	if len(nodes[0].PayloadFallback) != 1 || !nodes[0].PayloadFallback[0].Unavailable {
++		t.Fatalf("node fallback = %+v", nodes[0].PayloadFallback)
++	}
++}
++
++// Single-kind latest reads (snapshot show/diff --kind, top-queries helpers)
++// recover newest-to-oldest as well; explicit refs still do not.
++func TestLatest_SingleKindLatestRecoversButRefsStayStrict(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putPlannerAt(t, s, k, "h1", "p-old", base)
++	putPlannerAt(t, s, k, "h1", "p-new", base.Add(time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE planner_stats SET payload_json = 'oops' WHERE content_hash = 'p-new'`); err != nil {
++		t.Fatal(err)
++	}
++	putActivityRef(t, s, k, "h1", "a-old", "primary", base.Add(2*time.Minute))
++	putActivityRef(t, s, k, "h1", "a-new", "primary", base.Add(3*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE activity_stats SET payload_json = 'oops' WHERE content_hash = 'a-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	if got, err := s.Get(ctx, k, PlannerKind(), NewRefLatest()); err != nil || got.AsPlanner().ContentHash != "p-old" {
++		t.Fatalf("planner latest = %+v, %v", got, err)
++	}
++	if got, err := s.Get(ctx, k, ActivityKind("primary"), NewRefLatest()); err != nil || got.AsActivity().ContentHash != "a-old" {
++		t.Fatalf("activity latest = %+v, %v", got, err)
++	}
++
++	// hash and index addressing the corrupt rows stay loud
++	if _, err := s.Get(ctx, k, PlannerKind(), NewRefHash("p-new")); err == nil {
++		t.Error("planner hash fell back silently")
++	}
++	if _, err := s.Get(ctx, k, ActivityKind("primary"), NewRefIndex(0)); err == nil {
++		t.Error("activity latest~0 fell back silently")
++	}
++}
++
++// LatestQueryStats/LatestActivity (unscoped) skip one node's torn newest row
++// per node, so list_top_queries-style reads survive a single bad capture.
++func TestLatest_UnscopedNodeReadsToleratePerNodeCorruption(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putQueryRef(t, s, k, "h1", "q-good", "alpha", base)
++	putQueryRef(t, s, k, "h1", "q-old", "beta", base.Add(time.Minute))
++	putQueryRef(t, s, k, "h1", "q-new", "beta", base.Add(2*time.Minute))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE query_stats SET payload_json = 'oops' WHERE content_hash = 'q-new'`); err != nil {
++		t.Fatal(err)
++	}
++	putActivityRef(t, s, k, "h1", "a-good", "alpha", base)
++
++	qs, err := s.LatestQueryStats(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	byNode := map[string]string{}
++	for i := range qs {
++		byNode[qs[i].Node.Source] = qs[i].ContentHash
++	}
++	if byNode["alpha"] != "q-good" || byNode["beta"] != "q-old" {
++		t.Fatalf("per-node fallback wrong: %+v", byNode)
++	}
++
++	acts, err := s.LatestActivity(ctx, k)
++	if err != nil || len(acts) != 1 || acts[0].ContentHash != "a-good" {
++		t.Fatalf("LatestActivity = %+v, %v", acts, err)
++	}
++}
++
++// normal latest semantics are unchanged when everything decodes: no recovery
++// report at all.
++func TestLatest_CleanStoreHasNoRecovery(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-time.Hour)
++
++	putSchemaAt(t, s, k, "h1", base)
++	putPlannerAt(t, s, k, "h1", "p1", base.Add(time.Minute))
++	putActivityRef(t, s, k, "h1", "a1", "primary", base.Add(time.Minute))
++
++	_, rec, err := s.GetAnnotatedLatest(ctx, k)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if rec.Degraded() || len(rec.Streams) != 0 {
++		t.Fatalf("clean store reported recovery: %+v", rec)
++	}
++	if n := rec.SkippedPayloads(); n != 0 {
++		t.Fatalf("skipped = %d", n)
++	}
++}
++
++// latest~N bounds-check semantics are unchanged and the resolved offset still
++// errors against its specific row.
++func TestLatest_IndexNStillPositionalAndStrict(t *testing.T) {
++	ctx := context.Background()
++	s := testStore(t)
++	k := key("acme", "primary")
++	base := time.Now().UTC().Truncate(time.Second).Add(-2 * time.Hour)
++
++	putSchemaAt(t, s, k, "h-old", base)
++	putSchemaAt(t, s, k, "h-new", base.Add(time.Hour))
++	if _, err := s.db.ExecContext(ctx,
++		`UPDATE snapshots SET snapshot_json = 'oops' WHERE content_hash = 'h-new'`); err != nil {
++		t.Fatal(err)
++	}
++
++	kind, ref, err := s.ResolveToken(ctx, k, "latest~1", "", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if snap, err := s.Get(ctx, k, kind, ref); err != nil || snap.AsSchema().ContentHash != "h-old" {
++		t.Fatalf("latest~1 = %+v, %v", snap, err)
++	}
++	if _, _, err := s.ResolveToken(ctx, k, "latest~5", "", ""); err == nil {
++		t.Error("out-of-range latest~N must still error")
++	}
++	kind0, ref0, err := s.ResolveToken(ctx, k, "latest~0", "", "")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if _, err := s.Get(ctx, k, kind0, ref0); err == nil {
++		t.Error("latest~0 must report its corrupt record, not fall back")
++	}
++}
+diff --git a/internal/history/inventory.go b/internal/history/inventory.go
+index 246b241..dbe5f17 100644
+--- a/internal/history/inventory.go
++++ b/internal/history/inventory.go
+@@ -5,6 +5,7 @@ import (
+ 	"database/sql"
+ 	"errors"
+ 	"fmt"
++	"strings"
+ 	"time"
+ )
+ 
+@@ -42,6 +43,11 @@ type (
+ 		// rows whose timestamp will not parse: excluded from the span above,
+ 		// counted here rather than dropped silently, as ListNodes does
+ 		CorruptRows int `json:"corrupt_rows,omitempty"`
++		// rows whose payload cannot be decoded or whose embedded identity
++		// (content hash; schema ref; node source) disagrees with the row
++		// columns. Latest assembly skips these newest-to-oldest; this count is
++		// store-wide and content-free, unlike the per-fallback report.
++		PayloadCorruptRows int `json:"payload_corrupt_rows,omitempty"`
+ 	}
+ )
+ 
+@@ -98,28 +104,39 @@ func (s *Store) streamSpan(ctx context.Context, key SnapshotKey, stream, table s
+ 	if perNode {
+ 		nodes = "COUNT(DISTINCT node_source)"
+ 	}
++	// the schema stream is the only one whose payload column is snapshot_json
++	// and whose rows carry no schema_ref_hash/node_source columns
++	payloadCol := "payload_json"
++	hasSchemaRef := true
++	if table == "snapshots" {
++		payloadCol = "snapshot_json"
++		hasSchemaRef = false
++	}
+ 	q := `SELECT COUNT(*),
+ 	             SUM(CASE WHEN timestamp GLOB ? THEN 0 ELSE 1 END),
+ 	             MIN(CASE WHEN timestamp GLOB ? THEN timestamp END),
+ 	             MAX(CASE WHEN timestamp GLOB ? THEN timestamp END),
+-	             ` + nodes + `
++	             ` + nodes + `,
++	             SUM(CASE WHEN ` + payloadOKExpr(payloadCol, hasSchemaRef, perNode) + ` THEN 0 ELSE 1 END)
+ 	        FROM ` + table + `
+ 	       WHERE project_id = ? AND database_id = ?`
+ 
+ 	var (
+ 		span           = StreamSpan{Stream: stream}
+ 		corrupt        sql.NullInt64
++		payloadCorrupt sql.NullInt64
+ 		oldest, newest sql.NullString
+ 		nodeCount      int
+ 	)
+ 	err := s.db.QueryRowContext(ctx, q,
+ 		readableTS, readableTS, readableTS,
+ 		string(key.ProjectID), string(key.DatabaseID),
+-	).Scan(&span.Rows, &corrupt, &oldest, &newest, &nodeCount)
++	).Scan(&span.Rows, &corrupt, &oldest, &newest, &nodeCount, &payloadCorrupt)
+ 	if err != nil {
+ 		return StreamSpan{}, err
+ 	}
+ 	span.CorruptRows = int(corrupt.Int64)
++	span.PayloadCorruptRows = int(payloadCorrupt.Int64)
+ 	if perNode {
+ 		span.Nodes = &nodeCount
+ 	}
+@@ -134,6 +151,26 @@ func (s *Store) streamSpan(ctx context.Context, key SnapshotKey, stream, table s
+ 	return span, nil
+ }
+ 
++// payloadOKExpr is the SQLite predicate for "this row's payload decodes and
++// its embedded identity agrees with its columns" -- the same rule tolerant
++// latest assembly enforces in Go. It only inspects JSON structure and scalar
++// fields, so it never surfaces payload bytes in an error.
++func payloadOKExpr(payloadCol string, hasSchemaRef, perNode bool) string {
++	conds := []string{
++		"json_valid(" + payloadCol + ")",
++		"json_extract(" + payloadCol + ", '$.content_hash') = content_hash",
++	}
++	if hasSchemaRef {
++		conds = append(conds,
++			"json_extract("+payloadCol+", '$.schema_ref_hash') = schema_ref_hash")
++		if perNode {
++			conds = append(conds,
++				"json_extract("+payloadCol+", '$.node.source') = node_source")
++		}
++	}
++	return strings.Join(conds, " AND ")
++}
++
+ // The newest attempt per stream, folded across node labels: one node still
+ // capturing is what says the stream is live. It cannot express PARTIAL
+ // liveness — two of three nodes gone reads as fresh — and Nodes counts labels
+diff --git a/internal/history/nodes.go b/internal/history/nodes.go
+index 8f3f6c0..963e937 100644
+--- a/internal/history/nodes.go
++++ b/internal/history/nodes.go
+@@ -30,6 +30,14 @@ type (
+ 		RoleFlipped bool `json:"role_flipped,omitempty"`
+ 		// a timestamp that would not parse; LastCapture is zero
+ 		CorruptRows int `json:"corrupt_rows,omitempty"`
++		// payload rows that will not decode, or whose embedded identity
++		// (content hash / schema ref / node source) disagrees with their
++		// columns, across both node-scoped streams. Content-free count.
++		PayloadCorruptRows int `json:"payload_corrupt_rows,omitempty"`
++		// what tolerant latest resolution does with this node's newest
++		// capture per stream: skipped rows above the served capture, or an
++		// unavailable stream whose every payload is unusable
++		PayloadFallback []NodeStreamFallback `json:"payload_fallback,omitempty"`
+ 		// distinct servers seen under this label in the recent window, and
+ 		// whether they alternate (a rotating endpoint) rather than succeed
+ 		// one another (a restart or a replacement)
+@@ -52,6 +60,18 @@ type (
+ 		ServerAddr string
+ 	}
+ 
++	// NodeStreamFallback describes tolerant latest resolution for one of a
++	// node's streams. A clean newest capture produces no entry at all.
++	NodeStreamFallback struct {
++		Stream string `json:"stream"`
++		// unusable rows newer than the capture latest actually serves
++		Skipped int `json:"skipped_payloads,omitempty"`
++		// the capture latest serves this node from; nil when every row was unusable
++		ServedAt *time.Time `json:"served_at,omitempty"`
++		// the stream has rows for this node but none could be served
++		Unavailable bool `json:"unavailable,omitempty"`
++	}
++
+ 	nodeAgg struct {
+ 		rows        int
+ 		last        time.Time
+@@ -123,6 +143,10 @@ func (s *Store) ListNodes(ctx context.Context, key SnapshotKey) ([]NodeSummary,
+ 	}
+ 
+ 	out := make([]NodeSummary, 0, len(byLabel))
++	recovery, err := s.nodePayloadRecovery(ctx, key)
++	if err != nil {
++		return nil, err
++	}
+ 	for _, n := range byLabel {
+ 		role, err := s.LatestNodeRole(ctx, key, n.Label)
+ 		if err != nil {
+@@ -132,6 +156,10 @@ func (s *Store) ListNodes(ctx context.Context, key SnapshotKey) ([]NodeSummary,
+ 		if r := seen[n.Label]; r != nil {
+ 			n.RoleFlipped = r.primary && r.standby
+ 		}
++		if agg, ok := recovery[n.Label]; ok {
++			n.PayloadCorruptRows = agg.corruptRows
++			n.PayloadFallback = agg.fallback
++		}
+ 		fps, err := s.RecentNodeFingerprints(ctx, key, n.Label)
+ 		if err != nil {
+ 			return nil, err
+@@ -372,6 +400,114 @@ func nodeJSONExpr(prefix, path string) string {
+ 	return "CASE WHEN json_valid(" + col + ") THEN json_extract(" + col + ", '" + path + "') END"
+ }
+ 
++// nodePayloadAgg is the per-label accumulation across both node tables.
++type nodePayloadAgg struct {
++	corruptRows int
++	fallback    []NodeStreamFallback
++}
++
++// nodePayloadRecovery walks each node-scoped stream newest-first per node and
++// reports what tolerant latest resolution would do with it: unusable rows
++// above the served capture, and a stream with no servable row at all. The
++// validity rule matches GetAnnotatedLatest (decode plus identity agreement).
++// Rows whose timestamp will not parse are excluded -- they are already the
++// timestamp CorruptRows tally and cannot be placed newest-to-oldest.
++func (s *Store) nodePayloadRecovery(ctx context.Context, key SnapshotKey) (map[string]nodePayloadAgg, error) {
++	pid, did := string(key.ProjectID), string(key.DatabaseID)
++	out := map[string]nodePayloadAgg{}
++
++	for _, t := range nodeTables {
++		// table is a caller-side literal, never user input.
++		rows, err := s.db.QueryContext(ctx,
++			`SELECT node_source, content_hash, schema_ref_hash, timestamp, payload_json
++			   FROM `+t.table+`
++			  WHERE project_id = ? AND database_id = ? AND timestamp GLOB ?
++			  ORDER BY node_source ASC, timestamp DESC, id DESC`,
++			pid, did, readableTS)
++		if err != nil {
++			return nil, err
++		}
++
++		type walkState struct {
++			saw, picked  bool
++			skipped      int
++			corruptTotal int
++			servedAt     time.Time
++		}
++		states := map[string]*walkState{}
++		var order []string
++
++		walk := func() error {
++			defer rows.Close()
++			for rows.Next() {
++				var label, colHash, colRef, tsStr, payload string
++				if err := rows.Scan(&label, &colHash, &colRef, &tsStr, &payload); err != nil {
++					return err
++				}
++				ts, ok := parseHistoryTS(tsStr)
++				if !ok {
++					continue
++				}
++				st, exists := states[label]
++				if !exists {
++					st = &walkState{}
++					states[label] = st
++					order = append(order, label)
++				}
++				st.saw = true
++				bad := true
++				switch t.stream {
++				case "activity":
++					var a schema.ActivityStatsSnapshot
++					if json.Unmarshal([]byte(payload), &a) == nil {
++						bad = a.ContentHash == "" || a.ContentHash != colHash ||
++							a.SchemaRefHash != colRef || a.Node.Source != label
++					}
++				case "query":
++					var q schema.QueryStatsSnapshot
++					if json.Unmarshal([]byte(payload), &q) == nil {
++						bad = q.ContentHash == "" || q.ContentHash != colHash ||
++							q.SchemaRefHash != colRef || q.Node.Source != label
++					}
++				}
++				if bad {
++					st.corruptTotal++
++					if !st.picked {
++						st.skipped++
++					}
++					continue
++				}
++				if !st.picked {
++					st.picked = true
++					st.servedAt = ts
++				}
++			}
++			return rows.Err()
++		}
++		if err := walk(); err != nil {
++			return nil, err
++		}
++
++		for _, label := range order {
++			st := states[label]
++			agg := out[label]
++			agg.corruptRows += st.corruptTotal
++			if st.saw && (!st.picked || st.skipped > 0) {
++				fb := NodeStreamFallback{Stream: t.stream, Skipped: st.skipped}
++				if st.picked {
++					served := st.servedAt
++					fb.ServedAt = &served
++				} else {
++					fb.Unavailable = true
++				}
++				agg.fallback = append(agg.fallback, fb)
++			}
++			out[label] = agg
++		}
++	}
++	return out, nil
++}
++
+ func nodeStandbyExpr(prefix string) string {
+ 	return nodeJSONExpr(prefix, "$.node.is_standby")
+ }
+diff --git a/internal/history/stats.go b/internal/history/stats.go
+index f6b1dce..66e05e9 100644
+--- a/internal/history/stats.go
++++ b/internal/history/stats.go
+@@ -221,43 +221,24 @@ func (s *Store) GetQueryStats(ctx context.Context, key SnapshotKey, schemaRefHas
+ 	return out, rows.Err()
+ }
+ 
+-// LatestQueryStats returns the newest snapshot per node_source. Unlike
++// LatestQueryStats returns the newest VALID snapshot per node_source. Unlike
+ // GetQueryStats it is not schema_ref_hash-scoped, so callers still get the
+-// latest stats after DDL has moved on. Ties on timestamp (two pushes for the
+-// same node within the same RFC3339 second) are broken by id so a node never
+-// contributes more than one row.
++// latest stats after DDL has moved on. A node whose newest payload is torn
++// falls back to its own next-newest decodable, identity-consistent row, so
++// one bad capture never blanks every node; a node with no valid row is
++// omitted. Ties on timestamp (two pushes for the same node within the same
++// RFC3339 second) are broken by id so a node never contributes more than one
++// row. This is a latest selection, so it tolerates corruption -- explicit
++// refs stay strict.
+ func (s *Store) LatestQueryStats(ctx context.Context, key SnapshotKey) ([]schema.QueryStatsSnapshot, error) {
+-	rows, err := s.db.QueryContext(ctx,
+-		`SELECT payload_json FROM query_stats AS q
+-		  WHERE project_id = ? AND database_id = ?
+-		    AND id = (
+-		      SELECT id FROM query_stats
+-		       WHERE project_id = q.project_id
+-		         AND database_id = q.database_id
+-		         AND node_source = q.node_source
+-		       ORDER BY timestamp DESC, id DESC LIMIT 1
+-		    )
+-		  ORDER BY node_source`,
+-		string(key.ProjectID), string(key.DatabaseID),
+-	)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer rows.Close()
+-
+-	var out []schema.QueryStatsSnapshot
+-	for rows.Next() {
+-		var jsonStr string
+-		if err := rows.Scan(&jsonStr); err != nil {
+-			return nil, err
+-		}
+-		var q schema.QueryStatsSnapshot
+-		if err := json.Unmarshal([]byte(jsonStr), &q); err != nil {
+-			return nil, fmt.Errorf("corrupt query stats JSON: %w", err)
+-		}
+-		out = append(out, q)
+-	}
+-	return out, rows.Err()
++	out, _, err := scanLatestValidNodeRows[schema.QueryStatsSnapshot](
++		ctx, s.db, "query_stats", "query",
++		string(key.ProjectID), string(key.DatabaseID), "",
++		func(q *schema.QueryStatsSnapshot, contentHash, schemaRefHash, node string) bool {
++			return q.ContentHash != "" && q.ContentHash == contentHash &&
++				q.SchemaRefHash == schemaRefHash && q.Node.Source == node
++		})
++	return out, err
+ }
+ 
+ // PreviousQueryStats returns, per node_source, the capture the newest one is
+@@ -302,30 +283,41 @@ func (s *Store) PreviousQueryStats(ctx context.Context, key SnapshotKey) ([]sche
+ 	return s.previousWithinMember(ctx, key, out)
+ }
+ 
++// LatestPlanner returns the newest VALID planner capture across schema
++// generations. It is a latest selection, so a torn newest row falls back to
++// the nearest older decodable, identity-consistent one; only a completely
++// empty planner table is ErrSnapshotNotFound.
+ func (s *Store) LatestPlanner(ctx context.Context, key SnapshotKey) (*schema.PlannerStatsSnapshot, error) {
+-	var jsonStr string
+-	err := s.db.QueryRowContext(ctx,
+-		`SELECT payload_json FROM planner_stats
+-		  WHERE project_id = ? AND database_id = ?
+-		  ORDER BY timestamp DESC, id DESC LIMIT 1`,
+-		string(key.ProjectID), string(key.DatabaseID),
+-	).Scan(&jsonStr)
+-	if errors.Is(err, sql.ErrNoRows) {
+-		return nil, fmt.Errorf("%w (latest planner)", ErrSnapshotNotFound)
+-	}
++	p, fb, err := s.latestValidPlannerRow(ctx,
++		string(key.ProjectID), string(key.DatabaseID), "")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-
+-	var p schema.PlannerStatsSnapshot
+-	if err := json.Unmarshal([]byte(jsonStr), &p); err != nil {
+-		return nil, fmt.Errorf("corrupt planner stats JSON: %w", err)
++	if p != nil {
++		return p, nil
+ 	}
+-	return &p, nil
++	if fb.Reason != "" {
++		// rows existed but none usable: the caller treats nil as "no stamp",
++		// which for a best-effort pending marker is the right degradation
++		slog.Debug("LatestPlanner found only unusable payloads", "reason", fb.Reason)
++		return nil, nil
++	}
++	return nil, fmt.Errorf("%w (latest planner)", ErrSnapshotNotFound)
+ }
+ 
+-// ErrSnapshotNotFound only when schema is missing; planner/activity can be absent
++// ErrSnapshotNotFound only when schema is missing; planner/activity can be absent.
++//
++// Only an unqualified latest tolerates corruption: it resolves newest-to-oldest
++// and serves the nearest decodable, identity-consistent generation (see
++// GetAnnotatedLatest). Every other ref — a content hash, latest~N, a point in
++// time — names one record and must fail against that record, so a corrupt row
++// there stays a loud error instead of silently switching targets.
+ func (s *Store) GetAnnotated(ctx context.Context, key SnapshotKey, at SnapshotRef) (*schema.AnnotatedSchema, error) {
++	if at.Kind == RefLatest {
++		a, _, err := s.GetAnnotatedLatest(ctx, key)
++		return a, err
++	}
++
+ 	snap, err := s.GetSchema(ctx, key, at)
+ 	if err != nil {
+ 		return nil, err
+@@ -343,26 +335,9 @@ func (s *Store) GetAnnotated(ctx context.Context, key SnapshotKey, at SnapshotRe
+ 		return nil, err
+ 	}
+ 	if len(acts) > 0 {
+-		var nodes []schema.NodeActivity
+-		// newest row per label stays first: oldestActivityStamp and
+-		// PrimaryActivity read the first entry per label
+-		add := func(r schema.ActivityStatsSnapshot) {
+-			tables, indexes := schema.RollUpPartitionActivity(snap, r.Tables, r.Indexes)
+-			nodes = append(nodes, schema.NodeActivity{Node: r.Node, Tables: tables, Indexes: indexes})
+-		}
+-		for i := range acts {
+-			// best-effort: without them the label keeps its newest row
+-			members, err := s.activityMembers(ctx, key, snap.ContentHash, acts[i])
+-			if err != nil {
+-				if ctxErr(err) {
+-					return nil, err
+-				}
+-				slog.Debug("pool servers unavailable; label keeps its newest row", "node", acts[i].Node.Source, "error", err)
+-			}
+-			add(acts[i])
+-			for _, m := range members {
+-				add(m)
+-			}
++		nodes, err := s.joinActivityNodes(ctx, key, snap, acts)
++		if err != nil {
++			return nil, err
+ 		}
+ 		out.Merged = &schema.MergedActivity{Nodes: nodes}
+ 	}
+@@ -412,24 +387,33 @@ func resolveHashPrefix(ctx context.Context, db *sql.DB, prefix, query string, ar
+ }
+ 
+ // getPlannerRef resolves a SnapshotRef against the planner_stats table.
++// Only RefLatest tolerates a torn newest row (newest-to-oldest recovery);
++// hash/at/index name one record and fail against it.
+ func (s *Store) getPlannerRef(ctx context.Context, key SnapshotKey, at SnapshotRef) (*schema.PlannerStatsSnapshot, error) {
+ 	pid := string(key.ProjectID)
+ 	did := string(key.DatabaseID)
+ 
++	if at.Kind == RefLatest {
++		const detail = "latest planner"
++		p, fb, err := s.latestValidPlannerRow(ctx, pid, did, "")
++		if err != nil {
++			return nil, err
++		}
++		if p == nil {
++			if fb.Reason != "" {
++				return nil, fmt.Errorf("%w (%s): %s", ErrHistoryCorrupt, detail, fb.Reason)
++			}
++			return nil, fmt.Errorf("%w (%s)", ErrSnapshotNotFound, detail)
++		}
++		return p, nil
++	}
++
+ 	var (
+ 		jsonStr string
+ 		err     error
+ 		detail  string
+ 	)
+ 	switch at.Kind {
+-	case RefLatest:
+-		detail = "latest planner"
+-		err = s.db.QueryRowContext(ctx,
+-			`SELECT payload_json FROM planner_stats
+-			  WHERE project_id = ? AND database_id = ?
+-			  ORDER BY timestamp DESC, id DESC LIMIT 1`,
+-			pid, did,
+-		).Scan(&jsonStr)
+ 	case RefAt:
+ 		detail = fmt.Sprintf("planner at-or-before %s", at.At.Format(time.RFC3339))
+ 		err = s.db.QueryRowContext(ctx,
+@@ -478,11 +462,33 @@ func (s *Store) getPlannerRef(ctx context.Context, key SnapshotKey, at SnapshotR
+ }
+ 
+ // getActivityRef resolves a SnapshotRef against activity_stats, optionally
+-// filtered to a single node_source.
++// filtered to a single node_source. Only RefLatest tolerates a torn newest
++// row; hash/at/index name one record and fail against it.
+ func (s *Store) getActivityRef(ctx context.Context, key SnapshotKey, nodeLabel string, at SnapshotRef) (*schema.ActivityStatsSnapshot, error) {
+ 	pid := string(key.ProjectID)
+ 	did := string(key.DatabaseID)
+ 
++	if at.Kind == RefLatest {
++		detail := "latest activity"
++		a, skipped, saw, err := latestValidNodeStatRow[schema.ActivityStatsSnapshot](
++			ctx, s.db, "activity_stats", pid, did, nodeLabel, "",
++			func(v *schema.ActivityStatsSnapshot, contentHash, schemaRefHash, node string) bool {
++				return v.ContentHash != "" && v.ContentHash == contentHash &&
++					v.SchemaRefHash == schemaRefHash && v.Node.Source == node
++			})
++		if err != nil {
++			return nil, err
++		}
++		if a != nil {
++			return a, nil
++		}
++		if !saw {
++			return nil, fmt.Errorf("%w (%s)", ErrSnapshotNotFound, detail)
++		}
++		return nil, fmt.Errorf("%w (%s): skipped %d unusable newest row(s)",
++			ErrHistoryCorrupt, detail, skipped)
++	}
++
+ 	where := ` FROM activity_stats
+ 	           WHERE project_id = ? AND database_id = ?`
+ 	args := []any{pid, did}
+@@ -498,9 +504,6 @@ func (s *Store) getActivityRef(ctx context.Context, key SnapshotKey, nodeLabel s
+ 		detail  string
+ 	)
+ 	switch at.Kind {
+-	case RefLatest:
+-		detail = "latest activity"
+-		err = s.db.QueryRowContext(ctx, base+" ORDER BY timestamp DESC, id DESC LIMIT 1", args...).Scan(&jsonStr)
+ 	case RefAt:
+ 		detail = fmt.Sprintf("activity at-or-before %s", at.At.Format(time.RFC3339))
+ 		args = append(args, formatHistoryTS(at.At))
+@@ -545,7 +548,8 @@ func (s *Store) listPlanner(ctx context.Context, key SnapshotKey, rng TimeRange)
+ 		sb   strings.Builder
+ 		args []any
+ 	)
+-	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, timestamp, project_id, database_id
++	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, timestamp, project_id, database_id,
++	                       CASE WHEN ` + payloadOKExpr("payload_json", true, false) + ` THEN 0 ELSE 1 END
+ 	                  FROM planner_stats WHERE project_id = ? AND database_id = ?`)
+ 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
+ 	if rng.From != nil {
+@@ -567,12 +571,12 @@ func (s *Store) listPlanner(ctx context.Context, key SnapshotKey, rng TimeRange)
+ 	var out []SnapshotSummary
+ 	for rows.Next() {
+ 		var (
+-			ss    SnapshotSummary
+-			tsStr string
+-			pid   sql.NullString
+-			did   sql.NullString
++			ss             SnapshotSummary
++			tsStr          string
++			pid, did       sql.NullString
++			payloadCorrupt int
+ 		)
+-		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &tsStr, &pid, &did); err != nil {
++		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &tsStr, &pid, &did, &payloadCorrupt); err != nil {
+ 			return nil, err
+ 		}
+ 		ss.Kind = PlannerKind()
+@@ -585,6 +589,7 @@ func (s *Store) listPlanner(ctx context.Context, key SnapshotKey, rng TimeRange)
+ 			v := did.String
+ 			ss.DatabaseID = &v
+ 		}
++		ss.PayloadCorrupt = payloadCorrupt != 0
+ 		out = append(out, ss)
+ 	}
+ 	return out, rows.Err()
+@@ -595,7 +600,8 @@ func (s *Store) listActivity(ctx context.Context, key SnapshotKey, nodeLabel str
+ 		sb   strings.Builder
+ 		args []any
+ 	)
+-	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id
++	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id,
++	                       CASE WHEN ` + payloadOKExpr("payload_json", true, true) + ` THEN 0 ELSE 1 END
+ 	                  FROM activity_stats WHERE project_id = ? AND database_id = ?`)
+ 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
+ 	if nodeLabel != "" {
+@@ -621,13 +627,12 @@ func (s *Store) listActivity(ctx context.Context, key SnapshotKey, nodeLabel str
+ 	var out []SnapshotSummary
+ 	for rows.Next() {
+ 		var (
+-			ss    SnapshotSummary
+-			tsStr string
+-			label string
+-			pid   sql.NullString
+-			did   sql.NullString
++			ss             SnapshotSummary
++			tsStr, label   string
++			pid, did       sql.NullString
++			payloadCorrupt int
+ 		)
+-		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did); err != nil {
++		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did, &payloadCorrupt); err != nil {
+ 			return nil, err
+ 		}
+ 		ss.Kind = ActivityKind(label)
+@@ -641,17 +646,40 @@ func (s *Store) listActivity(ctx context.Context, key SnapshotKey, nodeLabel str
+ 			v := did.String
+ 			ss.DatabaseID = &v
+ 		}
++		ss.PayloadCorrupt = payloadCorrupt != 0
+ 		out = append(out, ss)
+ 	}
+ 	return out, rows.Err()
+ }
+ 
+ // getQueryStatsRef resolves a SnapshotRef against query_stats, optionally
+-// filtered to a single node_source.
++// filtered to a single node_source. Only RefLatest tolerates a torn newest
++// row; hash/at/index name one record and fail against it.
+ func (s *Store) getQueryStatsRef(ctx context.Context, key SnapshotKey, nodeLabel string, at SnapshotRef) (*schema.QueryStatsSnapshot, error) {
+ 	pid := string(key.ProjectID)
+ 	did := string(key.DatabaseID)
+ 
++	if at.Kind == RefLatest {
++		detail := "latest query stats"
++		q, skipped, saw, err := latestValidNodeStatRow[schema.QueryStatsSnapshot](
++			ctx, s.db, "query_stats", pid, did, nodeLabel, "",
++			func(v *schema.QueryStatsSnapshot, contentHash, schemaRefHash, node string) bool {
++				return v.ContentHash != "" && v.ContentHash == contentHash &&
++					v.SchemaRefHash == schemaRefHash && v.Node.Source == node
++			})
++		if err != nil {
++			return nil, err
++		}
++		if q != nil {
++			return q, nil
++		}
++		if !saw {
++			return nil, fmt.Errorf("%w (%s)", ErrSnapshotNotFound, detail)
++		}
++		return nil, fmt.Errorf("%w (%s): skipped %d unusable newest row(s)",
++			ErrHistoryCorrupt, detail, skipped)
++	}
++
+ 	where := ` FROM query_stats
+ 	           WHERE project_id = ? AND database_id = ?`
+ 	args := []any{pid, did}
+@@ -667,10 +695,6 @@ func (s *Store) getQueryStatsRef(ctx context.Context, key SnapshotKey, nodeLabel
+ 		detail  string
+ 	)
+ 	switch at.Kind {
+-	case RefLatest:
+-		detail = "latest query stats"
+-		// id tiebreak: same-second captures collide at RFC3339 granularity
+-		err = s.db.QueryRowContext(ctx, base+" ORDER BY timestamp DESC, id DESC LIMIT 1", args...).Scan(&jsonStr)
+ 	case RefAt:
+ 		detail = fmt.Sprintf("query stats at-or-before %s", at.At.Format(time.RFC3339))
+ 		args = append(args, formatHistoryTS(at.At))
+@@ -715,7 +739,8 @@ func (s *Store) listQueryStats(ctx context.Context, key SnapshotKey, nodeLabel s
+ 		sb   strings.Builder
+ 		args []any
+ 	)
+-	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id
++	sb.WriteString(`SELECT id, schema_ref_hash, content_hash, node_source, timestamp, project_id, database_id,
++	                       CASE WHEN ` + payloadOKExpr("payload_json", true, true) + ` THEN 0 ELSE 1 END
+ 	                  FROM query_stats WHERE project_id = ? AND database_id = ?`)
+ 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
+ 	if nodeLabel != "" {
+@@ -741,13 +766,12 @@ func (s *Store) listQueryStats(ctx context.Context, key SnapshotKey, nodeLabel s
+ 	var out []SnapshotSummary
+ 	for rows.Next() {
+ 		var (
+-			ss    SnapshotSummary
+-			tsStr string
+-			label string
+-			pid   sql.NullString
+-			did   sql.NullString
++			ss             SnapshotSummary
++			tsStr, label   string
++			pid, did       sql.NullString
++			payloadCorrupt int
+ 		)
+-		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did); err != nil {
++		if err := rows.Scan(&ss.ID, &ss.SchemaRefHash, &ss.ContentHash, &label, &tsStr, &pid, &did, &payloadCorrupt); err != nil {
+ 			return nil, err
+ 		}
+ 		ss.Kind = QueryKind(label)
+@@ -761,6 +785,7 @@ func (s *Store) listQueryStats(ctx context.Context, key SnapshotKey, nodeLabel s
+ 			v := did.String
+ 			ss.DatabaseID = &v
+ 		}
++		ss.PayloadCorrupt = payloadCorrupt != 0
+ 		out = append(out, ss)
+ 	}
+ 	return out, rows.Err()
+@@ -795,37 +820,18 @@ func (s *Store) LatestNodeRole(ctx context.Context, key SnapshotKey, nodeLabel s
+ 	return roleFromExtract(standby), nil
+ }
+ 
+-// one row per node, taken at the most recent timestamp per node_source
++// LatestActivity returns the newest VALID capture per node_source across all
++// schema generations. A torn newest row falls back to that node's next-newest
++// decodable, identity-consistent capture instead of failing the whole read;
++// nodes with no valid row are omitted. Latest selection, so tolerant --
++// explicit refs stay strict.
+ func (s *Store) LatestActivity(ctx context.Context, key SnapshotKey) ([]schema.ActivityStatsSnapshot, error) {
+-	rows, err := s.db.QueryContext(ctx,
+-		`SELECT payload_json FROM activity_stats AS a
+-		  WHERE project_id = ? AND database_id = ?
+-		    AND id = (
+-		      SELECT id FROM activity_stats
+-		       WHERE project_id = a.project_id
+-		         AND database_id = a.database_id
+-		         AND node_source = a.node_source
+-		       ORDER BY timestamp DESC, id DESC LIMIT 1
+-		    )
+-		  ORDER BY node_source`,
+-		string(key.ProjectID), string(key.DatabaseID),
+-	)
+-	if err != nil {
+-		return nil, err
+-	}
+-	defer rows.Close()
+-
+-	var out []schema.ActivityStatsSnapshot
+-	for rows.Next() {
+-		var jsonStr string
+-		if err := rows.Scan(&jsonStr); err != nil {
+-			return nil, err
+-		}
+-		var a schema.ActivityStatsSnapshot
+-		if err := json.Unmarshal([]byte(jsonStr), &a); err != nil {
+-			return nil, fmt.Errorf("corrupt activity stats JSON: %w", err)
+-		}
+-		out = append(out, a)
+-	}
+-	return out, rows.Err()
++	out, _, err := scanLatestValidNodeRows[schema.ActivityStatsSnapshot](
++		ctx, s.db, "activity_stats", "activity",
++		string(key.ProjectID), string(key.DatabaseID), "",
++		func(a *schema.ActivityStatsSnapshot, contentHash, schemaRefHash, node string) bool {
++			return a.ContentHash != "" && a.ContentHash == contentHash &&
++				a.SchemaRefHash == schemaRefHash && a.Node.Source == node
++		})
++	return out, err
+ }
+diff --git a/internal/history/store.go b/internal/history/store.go
+index 197babf..ddf7eea 100644
+--- a/internal/history/store.go
++++ b/internal/history/store.go
+@@ -43,6 +43,9 @@ type (
+ 		NodeLabel     string       `json:"node_label,omitempty"`
+ 		ProjectID     *string      `json:"project_id,omitempty"`
+ 		DatabaseID    *string      `json:"database_id,omitempty"`
++		// the stored payload will not decode or its embedded identity disagrees
++		// with the row columns; latest resolution skips rows like these
++		PayloadCorrupt bool `json:"payload_corrupt,omitempty"`
+ 	}
+ )
+ 
+@@ -532,7 +535,8 @@ func (s *Store) ListSchema(ctx context.Context, key SnapshotKey, rng TimeRange)
+ 		sb   strings.Builder
+ 		args []any
+ 	)
+-	sb.WriteString(`SELECT id, db_url_hash, timestamp, content_hash, database_name, project_id, database_id
++	sb.WriteString(`SELECT id, db_url_hash, timestamp, content_hash, database_name, project_id, database_id,
++	                       CASE WHEN ` + payloadOKExpr("snapshot_json", false, false) + ` THEN 0 ELSE 1 END
+ 	                  FROM snapshots WHERE project_id = ? AND database_id = ?`)
+ 	args = append(args, string(key.ProjectID), string(key.DatabaseID))
+ 	if rng.From != nil {
+@@ -553,10 +557,27 @@ func (s *Store) ListSchema(ctx context.Context, key SnapshotKey, rng TimeRange)
+ 
+ 	var out []SnapshotSummary
+ 	for rows.Next() {
+-		ss, err := scanSchemaSummary(rows)
+-		if err != nil {
++		var (
++			ss             SnapshotSummary
++			tsStr          string
++			pid, did       sql.NullString
++			payloadCorrupt int
++		)
++		if err := rows.Scan(&ss.ID, &ss.DBURLHash, &tsStr, &ss.ContentHash, &ss.Database, &pid, &did, &payloadCorrupt); err != nil {
+ 			return nil, err
+ 		}
++		ss.Kind = SchemaKind()
++		ss.Timestamp, _ = time.Parse(time.RFC3339, tsStr)
++		ss.SchemaRefHash = ss.ContentHash
++		if pid.Valid {
++			v := pid.String
++			ss.ProjectID = &v
++		}
++		if did.Valid {
++			v := did.String
++			ss.DatabaseID = &v
++		}
++		ss.PayloadCorrupt = payloadCorrupt != 0
+ 		out = append(out, ss)
+ 	}
+ 	return out, rows.Err()
+diff --git a/internal/mcp/freshness.go b/internal/mcp/freshness.go
+index 1932c24..5b69984 100644
+--- a/internal/mcp/freshness.go
++++ b/internal/mcp/freshness.go
+@@ -92,18 +92,50 @@ func (s *Server) adoptNewerSnapshot(ctx context.Context) {
+ 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+ 	defer cancel()
+ 
+-	a, err := hist.GetAnnotated(ctx, key, history.NewRefLatest())
++	a, rec, err := hist.GetAnnotatedLatest(ctx, key)
+ 	if err != nil || a == nil || a.Schema == nil {
+-		if err != nil && !errors.Is(err, history.ErrSnapshotNotFound) {
++		switch {
++		case errors.Is(err, history.ErrHistoryCorrupt) && served != nil:
++			// a new bad generation landed on top of a bundle we still hold:
++			// keep serving the valid bundle and mark it degraded. The
++			// freshness cadence retries; a later valid capture adopts itself.
++			// rec already carries the schema stream's skip count and reason.
++			if rec.ServedSchemaHash == "" {
++				rec.ServedSchemaHash = served.Schema.ContentHash
++			}
++			s.mu.Lock()
++			s.recovered = rec
++			s.mu.Unlock()
++			s.inventory.invalidate()
++			slog.Warn("newest history records unreadable; continuing to serve the last valid bundle", "error", err)
++		case errors.Is(err, history.ErrHistoryCorrupt):
++			s.mu.Lock()
++			s.historyLoadError = err.Error()
++			s.mu.Unlock()
++			slog.Warn("no readable schema in history; staying uninitialized", "error", err)
++		case err != nil && !errors.Is(err, history.ErrSnapshotNotFound):
+ 			slog.Warn("cannot read the newest snapshot from history", "error", err)
+ 		}
+ 		return
+ 	}
++
+ 	if served != nil {
+ 		if !bundleAdvanced(a, served) {
+-			// retry a failed pendingStamps computation: a stats-free bundle
+-			// never advances again. Gate: served bundle must be history's latest.
++			// the recovery report only describes what we serve when the
++			// candidate IS the served generation; an older history bundle
++			// (e.g. beside a live --db introspection) or another database's
++			// rows must not mark this server degraded
+ 			if a.Schema.ContentHash == served.Schema.ContentHash {
++				s.mu.Lock()
++				wasDegraded := s.recovered.Degraded()
++				s.recovered = rec
++				s.historyLoadError = ""
++				s.mu.Unlock()
++				if wasDegraded || rec.Degraded() {
++					s.inventory.invalidate()
++				}
++				// retry a failed pendingStamps computation: a stats-free
++				// bundle never advances again. Gate: served bundle must be history's latest.
+ 				s.mu.Lock()
+ 				s.pendingStamps = pendingReschemaStamps(ctx, hist, key, served)
+ 				s.mu.Unlock()
+@@ -122,6 +154,8 @@ func (s *Server) adoptNewerSnapshot(ctx context.Context) {
+ 	s.mu.Lock()
+ 	s.annotated = a
+ 	s.pendingStamps = pending
++	s.recovered = rec
++	s.historyLoadError = ""
+ 	s.uninitialized = false
+ 	s.mu.Unlock()
+ 	s.freshness.servedAt = a.Schema.Timestamp
+@@ -129,8 +163,13 @@ func (s *Server) adoptNewerSnapshot(ctx context.Context) {
+ 	// response can carry a schema_captured_at newer than the newest capture
+ 	// _meta.history reports, which reads as "what you are served is not stored"
+ 	s.inventory.invalidate()
+-	slog.Info("picked up a newer snapshot from history",
+-		"captured_at", a.Schema.Timestamp.UTC().Format(time.RFC3339), "content_hash", a.Schema.ContentHash)
++	if rec.Degraded() {
++		slog.Warn("serving an older valid bundle because newer history records are unreadable",
++			"served_hash", rec.ServedSchemaHash, "skipped_payloads", rec.SkippedPayloads())
++	} else {
++		slog.Info("picked up a newer snapshot from history",
++			"captured_at", a.Schema.Timestamp.UTC().Format(time.RFC3339), "content_hash", a.Schema.ContentHash)
++	}
+ }
+ 
+ // the prior-hash captures _meta shows beside stats_pending_reschema; a failed
+diff --git a/internal/mcp/freshness_corruption_test.go b/internal/mcp/freshness_corruption_test.go
+new file mode 100644
+index 0000000..60324dc
+--- /dev/null
++++ b/internal/mcp/freshness_corruption_test.go
+@@ -0,0 +1,236 @@
++package mcp
++
++import (
++	"context"
++	"database/sql"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++
++	_ "modernc.org/sqlite"
++
++	"github.com/boringsql/dryrun/internal/history"
++	"github.com/boringsql/dryrun/pkg/lint"
++)
++
++// historyStoreOnDisk opens a store and returns its path so the test can write
++// torn rows through a second connection, simulating an interrupted capture.
++func historyStoreOnDisk(t *testing.T) (*history.Store, string) {
++	t.Helper()
++	path := filepath.Join(t.TempDir(), "history.db")
++	hist, err := history.Open(path)
++	if err != nil {
++		t.Fatalf("history.Open: %v", err)
++	}
++	t.Cleanup(func() { hist.Close() })
++	return hist, path
++}
++
++func corruptExec(t *testing.T, path, query string, args ...any) {
++	t.Helper()
++	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer db.Close()
++	if _, err := db.Exec(query, args...); err != nil {
++		t.Fatalf("corrupt write (%s): %v", query, err)
++	}
++}
++
++func findHistorySpan(t *testing.T, spans []historySpan, stream string) historySpan {
++	t.Helper()
++	for _, sp := range spans {
++		if sp.Stream == stream {
++			return sp
++		}
++	}
++	t.Fatalf("no %s span in %+v", stream, spans)
++	return historySpan{}
++}
++
++// Cold start against a torn newest schema serves the nearest older valid
++// bundle and flags the response degraded -- offline tools must not blank out.
++func TestBootstrapFallsBackToOlderValidBundle(t *testing.T) {
++	t0 := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
++	hist, path := historyStoreOnDisk(t)
++	put(t, hist, datedSnap(t, t0, "old"))
++	put(t, hist, datedSnap(t, t0.Add(time.Hour), "new"))
++	corruptExec(t, path,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'new'`)
++
++	srv := NewOfflineServerAnnotated(nil, lint.DefaultConfig())
++	srv.SetHistory(hist)
++	srv.SetSnapshotKey(testKey)
++	if !srv.BootstrapFromHistory(context.Background()) {
++		t.Fatal("bootstrap must serve the older valid bundle")
++	}
++	if got := servedTable(t, srv); got != "old" {
++		t.Fatalf("served %q, want old", got)
++	}
++	if !srv.ServedDegraded() {
++		t.Error("cold start on a torn newest row must mark degraded")
++	}
++
++	meta := srv.newMeta("", nil)
++	if !meta.ServedDegraded {
++		t.Error("typed _meta missing served_degraded")
++	}
++	sp := findHistorySpan(t, meta.History, "schema")
++	if !sp.FellBack || sp.PayloadCorruptRows != 1 || sp.UnavailableReason != "" {
++		t.Errorf("schema span = %+v", sp)
++	}
++
++	// thin clients only see the text header
++	if suffix := srv.captureTimes().suffix(); !strings.Contains(suffix, "corrupt payload") {
++		t.Errorf("header hides the fallback: %q", suffix)
++	}
++
++	// the map-based _meta path carries the same marker
++	wrapper := map[string]any{}
++	srv.injectMeta(wrapper, "", nil)
++	mm, _ := wrapper["_meta"].(map[string]any)
++	if mm["served_degraded"] != true {
++		t.Errorf("map _meta missing served_degraded: %v", mm)
++	}
++}
++
++// A running server keeps its current valid bundle when a bad generation lands,
++// retries on the freshness cadence, and adopts the next valid capture,
++// clearing the degraded state automatically.
++func TestRunningServerKeepsBundleThenAutoRecovers(t *testing.T) {
++	t0 := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Second)
++	hist, path := historyStoreOnDisk(t)
++	put(t, hist, datedSnap(t, t0, "old"))
++
++	srv := serverWithHistory(t, datedSnap(t, t0, "old"), hist)
++	if got := servedTable(t, srv); got != "old" {
++		t.Fatalf("baseline served %q", got)
++	}
++	if srv.ServedDegraded() {
++		t.Fatal("clean store must not start degraded")
++	}
++
++	// a torn newer capture lands
++	put(t, hist, datedSnap(t, t0.Add(time.Hour), "mid"))
++	corruptExec(t, path,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'mid'`)
++	expireFreshness(srv)
++
++	if got := servedTable(t, srv); got != "old" {
++		t.Fatalf("bad generation replaced the served bundle with %q", got)
++	}
++	if !srv.ServedDegraded() {
++		t.Error("server kept serving but did not mark degraded")
++	}
++	sp := findHistorySpan(t, srv.newMeta("", nil).History, "schema")
++	if !sp.FellBack {
++		t.Errorf("fallback not reported: %+v", sp)
++	}
++
++	// a later valid capture arrives on the next freshness tick
++	put(t, hist, datedSnap(t, t0.Add(2*time.Hour), "latest"))
++	expireFreshness(srv)
++	if got := servedTable(t, srv); got != "latest" {
++		t.Fatalf("valid capture not adopted: %q", got)
++	}
++	if srv.ServedDegraded() {
++		t.Error("degraded state must clear once a valid capture is served")
++	}
++	sp = findHistorySpan(t, srv.newMeta("", nil).History, "schema")
++	if sp.FellBack || sp.UnavailableReason != "" {
++		t.Errorf("fallback marker did not clear: %+v", sp)
++	}
++	// the torn row is still counted store-wide; recovery is what cleared
++	if sp.PayloadCorruptRows != 1 {
++		t.Errorf("store-wide corruption count lost: %+v", sp)
++	}
++}
++
++// No decodable schema anywhere: the uninitialized error names the corruption
++// instead of pretending the database was never captured.
++func TestNoValidSchemaReportsExplicitCorruption(t *testing.T) {
++	t0 := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
++	hist, path := historyStoreOnDisk(t)
++	put(t, hist, datedSnap(t, t0, "only"))
++	corruptExec(t, path,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'only'`)
++
++	srv := NewOfflineServerAnnotated(nil, lint.DefaultConfig())
++	srv.SetHistory(hist)
++	srv.SetSnapshotKey(testKey)
++	if srv.BootstrapFromHistory(context.Background()) {
++		t.Fatal("bootstrap must fail when no valid predecessor exists")
++	}
++	note := srv.HistoryLoadError()
++	if note == "" || !strings.Contains(note, "corrupt history payload") {
++		t.Fatalf("load error = %q", note)
++	}
++	_, err := srv.getSchema()
++	if err == nil || !strings.Contains(err.Error(), "corrupt") {
++		t.Fatalf("tool error must name the corrupted range, got %v", err)
++	}
++}
++
++// One node's newest bad row degrades only that node; other nodes keep serving.
++func TestNodePayloadCorruptionDoesNotWipeOtherNodes(t *testing.T) {
++	t0 := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
++	hist, path := historyStoreOnDisk(t)
++	snap := datedSnap(t, t0, "s")
++	put(t, hist, snap)
++	putActivityAt(t, hist, snap.ContentHash, "alpha", t0.Add(time.Minute))
++	putActivityAt(t, hist, snap.ContentHash, "beta", t0.Add(2*time.Minute))
++	putActivityAt(t, hist, snap.ContentHash, "beta", t0.Add(3*time.Minute))
++	// newest beta row torn; alpha untouched
++	corruptExec(t, path,
++		`UPDATE activity_stats SET payload_json = 'oops'
++		  WHERE node_source = 'beta' AND timestamp = ?`,
++		t0.Add(3*time.Minute).Format(time.RFC3339))
++
++	srv := NewOfflineServerAnnotated(nil, lint.DefaultConfig())
++	srv.SetHistory(hist)
++	srv.SetSnapshotKey(testKey)
++	if !srv.BootstrapFromHistory(context.Background()) {
++		t.Fatal("bootstrap failed")
++	}
++	a, err := srv.getAnnotated()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if a.Merged == nil || len(a.Merged.Nodes) != 2 {
++		t.Fatalf("both nodes must serve, got %+v", a.Merged)
++	}
++	for _, n := range a.Merged.Nodes {
++		if n.Node.Source == "beta" && !n.Node.Timestamp.Equal(t0.Add(2*time.Minute)) {
++			t.Errorf("beta did not fall back: %s", n.Node.Timestamp)
++		}
++	}
++
++	sp := findHistorySpan(t, srv.newMeta("", nil).History, "activity")
++	if !srv.ServedDegraded() || len(sp.NodeFallbacks) != 1 {
++		t.Fatalf("activity span = %+v", sp)
++	}
++	nf := sp.NodeFallbacks[0]
++	if nf.Node != "beta" || nf.Skipped != 1 || nf.Reason != "" {
++		t.Errorf("node fallback = %+v", nf)
++	}
++	if sp.PayloadCorruptRows != 1 {
++		t.Errorf("payload_corrupt_rows = %d", sp.PayloadCorruptRows)
++	}
++}
++
++// Explicit history tools keep strict addressing even when latest tolerates.
++func TestStrictRefsStillErrorThroughStore(t *testing.T) {
++	t0 := time.Now().Add(-2 * time.Hour).UTC().Truncate(time.Second)
++	hist, path := historyStoreOnDisk(t)
++	put(t, hist, datedSnap(t, t0, "old"))
++	put(t, hist, datedSnap(t, t0.Add(time.Hour), "new"))
++	corruptExec(t, path,
++		`UPDATE snapshots SET snapshot_json = '{"broken' WHERE content_hash = 'new'`)
++
++	// the named corrupt record errors instead of resolving to "old"
++	if _, err := hist.GetSchema(context.Background(), testKey, history.NewRefHash("new")); err == nil {
++		t.Error("explicit hash silently fell back")
++	}
++}
+diff --git a/internal/mcp/helpers.go b/internal/mcp/helpers.go
+index cce8668..9afa80e 100644
+--- a/internal/mcp/helpers.go
++++ b/internal/mcp/helpers.go
+@@ -64,6 +64,9 @@ type (
+ 		ActivityOldestNode string `json:"activity_oldest_node,omitempty"`
+ 		// served hash has no stats yet: the timestamps above are a prior hash's
+ 		StatsPendingReschema bool `json:"stats_pending_reschema,omitempty"`
++		// the served bundle skipped corrupt newest records and was assembled
++		// from older valid ones; detail lives per stream in History
++		ServedDegraded bool `json:"served_degraded,omitempty"`
+ 		// semantics live in historyFieldDoc, which is what the wire carries -- do not restate them here
+ 		History []historySpan `json:"history,omitempty"`
+ 		// the store is there and could not be read -- absence already means
+@@ -95,6 +98,24 @@ type (
+ 		Nodes *int `json:"nodes,omitempty"`
+ 		// rows excluded from the span because their timestamp will not parse
+ 		CorruptRows int `json:"corrupt_rows,omitempty"`
++		// rows anywhere in the stream whose payload will not decode or whose
++		// embedded identity disagrees with their columns
++		PayloadCorruptRows int `json:"payload_corrupt_rows,omitempty"`
++		// tolerant latest skipped this stream's corrupt newest record(s) and
++		// served an older valid one instead
++		FellBack bool `json:"fell_back,omitempty"`
++		// the range the served schema requires holds rows but none usable;
++		// the stream is unavailable rather than merely uncaptured
++		UnavailableReason string `json:"unavailable_reason,omitempty"`
++		// per-node fallback detail on node-scoped streams
++		NodeFallbacks []historyNodeFallback `json:"node_fallbacks,omitempty"`
++	}
++
++	historyNodeFallback struct {
++		Node    string `json:"node"`
++		Skipped int    `json:"skipped_payloads,omitempty"`
++		// every payload for this node in the required range was unusable
++		Reason string `json:"unavailable_reason,omitempty"`
+ 	}
+ )
+ 
+@@ -112,6 +133,7 @@ func (s *Server) newMeta(hint string, next []NextCall) *toolMeta {
+ 		ActivityCapturedAt:   c.activity,
+ 		ActivityOldestNode:   c.activityNode,
+ 		StatsPendingReschema: c.pendingReschema,
++		ServedDegraded:       s.ServedDegraded(),
+ 		Hint:                 hint,
+ 		Next:                 next,
+ 	}
+@@ -133,6 +155,9 @@ func (s *Server) injectMeta(val map[string]any, hint string, next []NextCall) {
+ 	} else if !ok {
+ 		meta["history_unavailable"] = true
+ 	}
++	if s.ServedDegraded() {
++		meta["served_degraded"] = true
++	}
+ 	if hint != "" {
+ 		meta["hint"] = hint
+ 	}
+diff --git a/internal/mcp/history_span.go b/internal/mcp/history_span.go
+index 1a35979..0b68fac 100644
+--- a/internal/mcp/history_span.go
++++ b/internal/mcp/history_span.go
+@@ -5,6 +5,8 @@ import (
+ 	"log/slog"
+ 	"sync"
+ 	"time"
++
++	"github.com/boringsql/dryrun/internal/history"
+ )
+ 
+ const (
+@@ -58,11 +60,14 @@ func (s *Server) historySpans() ([]historySpan, bool) {
+ 	// under inventory.mu closes a cycle, and re-enters this non-reentrant
+ 	// mutex on the single-goroutine path. inventory.mu stays a leaf.
+ 	served := s.databaseName()
++	// recovery changes on adoption rather than on the inventory TTL, so it is
++	// read outside the cache and merged on every call -- also outside any lock.
++	rec := s.servedRecovery()
+ 
+ 	s.inventory.mu.Lock()
+ 	defer s.inventory.mu.Unlock()
+ 	if !s.inventory.readAt.IsZero() && time.Since(s.inventory.readAt) < historySpanTTL {
+-		return s.inventory.spans, !s.inventory.failed
++		return applyRecovery(s.inventory.spans, rec), !s.inventory.failed
+ 	}
+ 	// shorter than the store's busy_timeout: the next call retries a contended read
+ 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+@@ -101,17 +106,67 @@ func (s *Server) historySpans() ([]historySpan, bool) {
+ 	spans := make([]historySpan, 0, len(streams))
+ 	for _, st := range streams {
+ 		spans = append(spans, historySpan{
+-			Stream:      st.Stream,
+-			Rows:        st.Rows,
+-			Oldest:      stampPtr(st.Oldest),
+-			Newest:      stampPtr(st.Newest),
+-			LastAttempt: stampPtr(st.LastAttempt),
+-			Nodes:       st.Nodes,
+-			CorruptRows: st.CorruptRows,
++			Stream:             st.Stream,
++			Rows:               st.Rows,
++			Oldest:             stampPtr(st.Oldest),
++			Newest:             stampPtr(st.Newest),
++			LastAttempt:        stampPtr(st.LastAttempt),
++			Nodes:              st.Nodes,
++			CorruptRows:        st.CorruptRows,
++			PayloadCorruptRows: st.PayloadCorruptRows,
+ 		})
+ 	}
+ 	s.inventory.spans = spans
+-	return spans, true
++	return applyRecovery(spans, rec), true
++}
++
++// servedRecovery snapshots the served bundle's recovery report.
++func (s *Server) servedRecovery() history.LatestRecovery {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.recovered
++}
++
++// applyRecovery overlays the served bundle's fallback audit trail onto the
++// store-wide inventory spans. It copies: the cached slice is shared with every
++// concurrent caller and must never be mutated. Recovery streams reference
++// streams the inventory lists (their corrupt rows are still counted), but a
++// missing one is appended rather than dropped.
++func applyRecovery(base []historySpan, rec history.LatestRecovery) []historySpan {
++	if !rec.Degraded() {
++		return base
++	}
++	byStream := make(map[string]int, len(base))
++	out := make([]historySpan, len(base))
++	copy(out, base)
++	for i := range out {
++		byStream[out[i].Stream] = i
++	}
++	for _, f := range rec.Streams {
++		idx, ok := byStream[f.Stream]
++		if !ok {
++			hs := historySpan{
++				Stream:            f.Stream,
++				FellBack:          f.Skipped > 0,
++				UnavailableReason: f.Reason,
++			}
++			for _, n := range f.Nodes {
++				hs.NodeFallbacks = append(hs.NodeFallbacks,
++					historyNodeFallback{Node: n.Node, Skipped: n.Skipped, Reason: n.Reason})
++			}
++			out = append(out, hs)
++			continue
++		}
++		out[idx].FellBack = f.Skipped > 0
++		if f.Reason != "" {
++			out[idx].UnavailableReason = f.Reason
++		}
++		for _, n := range f.Nodes {
++			out[idx].NodeFallbacks = append(out[idx].NodeFallbacks,
++				historyNodeFallback{Node: n.Node, Skipped: n.Skipped, Reason: n.Reason})
++		}
++	}
++	return out
+ }
+ 
+ // An unknown instant is an absent field, never the zero date.
+diff --git a/internal/mcp/selection_note.go b/internal/mcp/selection_note.go
+index 9c4ef99..3ad09a9 100644
+--- a/internal/mcp/selection_note.go
++++ b/internal/mcp/selection_note.go
+@@ -33,4 +33,4 @@ func historyMetaNote(hasHistory bool) string {
+ 
+ // Shared by the instructions and output schemas so they cannot diverge.
+ // JSON-embeddable: no quotes, no newlines.
+-const historyFieldDoc = "_meta.history, when present, is what the local store holds per stream: rows stored (schema, planner and query dedup on content and activity does not, so on those three newest dates the newest DISTINCT content rather than the last capture), their oldest and newest, last_attempt for when this host last captured that stream SUCCESSFULLY, nodes where rows are node-scoped, and corrupt_rows for rows whose timestamp will not parse and are excluded from the span. It is absent when there is nothing to report for this database, INCLUDING when the store holds a different one, and when this build cannot open the store at all; history_unavailable: true marks the narrower case of a store this build opened and could not read."
++const historyFieldDoc = "_meta.history, when present, is what the local store holds per stream: rows stored (schema, planner and query dedup on content and activity does not, so on those three newest dates the newest DISTINCT content rather than the last capture), their oldest and newest, last_attempt for when this host last captured that stream SUCCESSFULLY, nodes where rows are node-scoped, and corrupt_rows for rows whose timestamp will not parse and are excluded from the span. payload_corrupt_rows counts rows whose stored payload cannot be decoded or whose embedded identity disagrees with the row columns. When the newest records are corrupt, an unqualified latest serves the nearest older valid capture bound to one schema_ref_hash rather than failing: fell_back marks a stream assembled from an older row, node_fallbacks gives per-node skipped payload counts, unavailable_reason names a required range with no valid predecessor, and _meta.served_degraded flags the response; the text header carries the same warning. Explicit content hash, latest~N and point-in-time reads never fall back, they report the corrupt record. It is absent when there is nothing to report for this database, INCLUDING when the store holds a different one, and when this build cannot open the store at all; history_unavailable: true marks the narrower case of a store this build opened and could not read."
+diff --git a/internal/mcp/server.go b/internal/mcp/server.go
+index d08fc5d..f95c0ba 100644
+--- a/internal/mcp/server.go
++++ b/internal/mcp/server.go
+@@ -34,6 +34,12 @@ type (
+ 		uninitialized   bool
+ 		freshness       freshness
+ 		inventory       historyInventory
++		// corruption-tolerant latest assembly audit trail for the served
++		// bundle: zero value means the newest records were served cleanly
++		recovered history.LatestRecovery
++		// why history could not supply any servable schema (corruption), so an
++		// uninitialized server says that instead of "never captured"
++		historyLoadError string
+ 	}
+ )
+ 
+@@ -86,19 +92,40 @@ func (s *Server) SetHistory(hist *history.Store) {
+ 	s.history = hist
+ }
+ 
++// BootstrapFromHistory serves history's newest VALID bundle directly. A torn
++// newest record does not fail the boot: latest resolution falls back to the
++// nearest decodable generation and the server starts degraded. Only when no
++// decodable schema exists at all does this return false.
+ func (s *Server) BootstrapFromHistory(ctx context.Context) bool {
+-	a, pending, ok := s.loadAnnotatedFromHistory(ctx)
++	a, pending, rec, ok := s.loadAnnotatedFromHistory(ctx)
+ 	if !ok || a == nil || a.Schema == nil {
+ 		return false
+ 	}
+ 	s.mu.Lock()
+ 	s.annotated = a
+ 	s.pendingStamps = pending
++	s.recovered = rec
+ 	s.uninitialized = false
+ 	s.mu.Unlock()
+ 	return true
+ }
+ 
++// HistoryLoadError reports the content-free reason history could not provide
++// a servable schema (all newest rows corrupt), or "" when it could.
++func (s *Server) HistoryLoadError() string {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.historyLoadError
++}
++
++// ServedDegraded reports whether the served bundle required skipping corrupt
++// newest records (schema fallback, per-node fallback, or an unusable range).
++func (s *Server) ServedDegraded() bool {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	return s.recovered.Degraded()
++}
++
+ // SchemaCounts reports the loaded snapshot's size; zeros when uninitialized.
+ func (s *Server) SchemaCounts() (tables, views, functions int) {
+ 	snap, err := s.getSchema()
+@@ -108,20 +135,32 @@ func (s *Server) SchemaCounts() (tables, views, functions int) {
+ 	return len(snap.Tables), len(snap.Views), len(snap.Functions)
+ }
+ 
+-func (s *Server) loadAnnotatedFromHistory(ctx context.Context) (*schema.AnnotatedSchema, captureStamps, bool) {
++func (s *Server) loadAnnotatedFromHistory(ctx context.Context) (*schema.AnnotatedSchema, captureStamps, history.LatestRecovery, bool) {
+ 	s.mu.RLock()
+ 	hist := s.history
+ 	key := s.snapshotKey
+ 	s.mu.RUnlock()
+ 	if hist == nil || key.ProjectID == "" {
+-		return nil, captureStamps{}, false
++		return nil, captureStamps{}, history.LatestRecovery{}, false
+ 	}
+-	a, err := hist.GetAnnotated(ctx, key, history.NewRefLatest())
++	a, rec, err := hist.GetAnnotatedLatest(ctx, key)
+ 	if err != nil {
+-		slog.Debug("history.GetAnnotated miss", "error", err)
+-		return nil, captureStamps{}, false
++		slog.Debug("history.GetAnnotatedLatest miss", "error", err)
++		s.mu.Lock()
++		// a store with no valid predecessor says why; an empty history stays
++		// silent and reads as "not captured yet"
++		if errors.Is(err, history.ErrHistoryCorrupt) {
++			s.historyLoadError = err.Error()
++		} else {
++			s.historyLoadError = ""
++		}
++		s.mu.Unlock()
++		return nil, captureStamps{}, rec, false
+ 	}
+-	return a, pendingReschemaStamps(ctx, hist, key, a), true
++	s.mu.Lock()
++	s.historyLoadError = ""
++	s.mu.Unlock()
++	return a, pendingReschemaStamps(ctx, hist, key, a), rec, true
+ }
+ 
+ func (s *Server) hasHistory() bool {
+@@ -163,6 +202,10 @@ func (s *Server) noSchemaMsg() string {
+ 		// an empty history and a project/database mismatch fail identically
+ 		msg += fmt.Sprintf(" (looked under project=%s database=%s)", s.snapshotKey.ProjectID, s.snapshotKey.DatabaseID)
+ 	}
++	// every newest record corrupt is not the same as never captured: name it
++	if s.historyLoadError != "" {
++		msg += ". history is present but unusable: " + s.historyLoadError
++	}
+ 	return msg
+ }
+ 
+@@ -212,6 +255,8 @@ type (
+ 		activityNode string
+ 		// planner/activity above are a prior hash's captures, not the served bundle's
+ 		pendingReschema bool
++		// served bundle was assembled around corrupt newest records; counts only
++		degradedNote string
+ 	}
+ )
+ 
+@@ -241,6 +286,7 @@ func (s *Server) captureTimes() captureStamps {
+ 	// dropping the fields, which would read as "never captured"
+ 	s.mu.RLock()
+ 	pending := s.pendingStamps
++	recovered := s.recovered
+ 	s.mu.RUnlock()
+ 	if c.planner == "" && pending.planner != "" {
+ 		c.planner = pending.planner
+@@ -251,6 +297,12 @@ func (s *Server) captureTimes() captureStamps {
+ 		c.activityNode = pending.activityNode
+ 		c.pendingReschema = true
+ 	}
++	if n := recovered.SkippedPayloads(); n > 0 {
++		c.degradedNote = fmt.Sprintf(
++			"serving an older valid snapshot: %d corrupt payload row(s) skipped; see _meta.history", n)
++	} else if recovered.Degraded() {
++		c.degradedNote = "serving with unavailable history stream(s); see _meta.history"
++	}
+ 	return c
+ }
+ 
+@@ -318,6 +370,9 @@ func (c captureStamps) suffix() string {
+ 		// the header must not pass prior-hash timestamps as the served bundle's
+ 		parts = append(parts, "stats pending reschema")
+ 	}
++	if c.degradedNote != "" {
++		parts = append(parts, c.degradedNote)
++	}
+ 	if len(parts) == 0 {
+ 		return ""
+ 	}
+@@ -339,6 +394,10 @@ func (s *Server) Instructions() string {
+ 	if note := s.historyNote(); note != nil {
+ 		metaNote += "\n\nWarning: " + *note + "."
+ 	}
++	// a cold start against a torn newest record serves an older valid bundle
++	if d := s.captureTimes().degradedNote; d != "" {
++		metaNote += "\n\nWarning: " + d + "."
++	}
+ 
+ 	dv := buildinfo.Get()
+ 

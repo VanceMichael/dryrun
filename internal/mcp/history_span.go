@@ -5,6 +5,8 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+
+	"github.com/boringsql/dryrun/internal/history"
 )
 
 const (
@@ -58,11 +60,14 @@ func (s *Server) historySpans() ([]historySpan, bool) {
 	// under inventory.mu closes a cycle, and re-enters this non-reentrant
 	// mutex on the single-goroutine path. inventory.mu stays a leaf.
 	served := s.databaseName()
+	// recovery changes on adoption rather than on the inventory TTL, so it is
+	// read outside the cache and merged on every call -- also outside any lock.
+	rec := s.servedRecovery()
 
 	s.inventory.mu.Lock()
 	defer s.inventory.mu.Unlock()
 	if !s.inventory.readAt.IsZero() && time.Since(s.inventory.readAt) < historySpanTTL {
-		return s.inventory.spans, !s.inventory.failed
+		return applyRecovery(s.inventory.spans, rec), !s.inventory.failed
 	}
 	// shorter than the store's busy_timeout: the next call retries a contended read
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -101,17 +106,67 @@ func (s *Server) historySpans() ([]historySpan, bool) {
 	spans := make([]historySpan, 0, len(streams))
 	for _, st := range streams {
 		spans = append(spans, historySpan{
-			Stream:      st.Stream,
-			Rows:        st.Rows,
-			Oldest:      stampPtr(st.Oldest),
-			Newest:      stampPtr(st.Newest),
-			LastAttempt: stampPtr(st.LastAttempt),
-			Nodes:       st.Nodes,
-			CorruptRows: st.CorruptRows,
+			Stream:             st.Stream,
+			Rows:               st.Rows,
+			Oldest:             stampPtr(st.Oldest),
+			Newest:             stampPtr(st.Newest),
+			LastAttempt:        stampPtr(st.LastAttempt),
+			Nodes:              st.Nodes,
+			CorruptRows:        st.CorruptRows,
+			PayloadCorruptRows: st.PayloadCorruptRows,
 		})
 	}
 	s.inventory.spans = spans
-	return spans, true
+	return applyRecovery(spans, rec), true
+}
+
+// servedRecovery snapshots the served bundle's recovery report.
+func (s *Server) servedRecovery() history.LatestRecovery {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.recovered
+}
+
+// applyRecovery overlays the served bundle's fallback audit trail onto the
+// store-wide inventory spans. It copies: the cached slice is shared with every
+// concurrent caller and must never be mutated. Recovery streams reference
+// streams the inventory lists (their corrupt rows are still counted), but a
+// missing one is appended rather than dropped.
+func applyRecovery(base []historySpan, rec history.LatestRecovery) []historySpan {
+	if !rec.Degraded() {
+		return base
+	}
+	byStream := make(map[string]int, len(base))
+	out := make([]historySpan, len(base))
+	copy(out, base)
+	for i := range out {
+		byStream[out[i].Stream] = i
+	}
+	for _, f := range rec.Streams {
+		idx, ok := byStream[f.Stream]
+		if !ok {
+			hs := historySpan{
+				Stream:            f.Stream,
+				FellBack:          f.Skipped > 0,
+				UnavailableReason: f.Reason,
+			}
+			for _, n := range f.Nodes {
+				hs.NodeFallbacks = append(hs.NodeFallbacks,
+					historyNodeFallback{Node: n.Node, Skipped: n.Skipped, Reason: n.Reason})
+			}
+			out = append(out, hs)
+			continue
+		}
+		out[idx].FellBack = f.Skipped > 0
+		if f.Reason != "" {
+			out[idx].UnavailableReason = f.Reason
+		}
+		for _, n := range f.Nodes {
+			out[idx].NodeFallbacks = append(out[idx].NodeFallbacks,
+				historyNodeFallback{Node: n.Node, Skipped: n.Skipped, Reason: n.Reason})
+		}
+	}
+	return out
 }
 
 // An unknown instant is an absent field, never the zero date.

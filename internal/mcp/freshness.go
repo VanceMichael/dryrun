@@ -92,18 +92,50 @@ func (s *Server) adoptNewerSnapshot(ctx context.Context) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	a, err := hist.GetAnnotated(ctx, key, history.NewRefLatest())
+	a, rec, err := hist.GetAnnotatedLatest(ctx, key)
 	if err != nil || a == nil || a.Schema == nil {
-		if err != nil && !errors.Is(err, history.ErrSnapshotNotFound) {
+		switch {
+		case errors.Is(err, history.ErrHistoryCorrupt) && served != nil:
+			// a new bad generation landed on top of a bundle we still hold:
+			// keep serving the valid bundle and mark it degraded. The
+			// freshness cadence retries; a later valid capture adopts itself.
+			// rec already carries the schema stream's skip count and reason.
+			if rec.ServedSchemaHash == "" {
+				rec.ServedSchemaHash = served.Schema.ContentHash
+			}
+			s.mu.Lock()
+			s.recovered = rec
+			s.mu.Unlock()
+			s.inventory.invalidate()
+			slog.Warn("newest history records unreadable; continuing to serve the last valid bundle", "error", err)
+		case errors.Is(err, history.ErrHistoryCorrupt):
+			s.mu.Lock()
+			s.historyLoadError = err.Error()
+			s.mu.Unlock()
+			slog.Warn("no readable schema in history; staying uninitialized", "error", err)
+		case err != nil && !errors.Is(err, history.ErrSnapshotNotFound):
 			slog.Warn("cannot read the newest snapshot from history", "error", err)
 		}
 		return
 	}
+
 	if served != nil {
 		if !bundleAdvanced(a, served) {
-			// retry a failed pendingStamps computation: a stats-free bundle
-			// never advances again. Gate: served bundle must be history's latest.
+			// the recovery report only describes what we serve when the
+			// candidate IS the served generation; an older history bundle
+			// (e.g. beside a live --db introspection) or another database's
+			// rows must not mark this server degraded
 			if a.Schema.ContentHash == served.Schema.ContentHash {
+				s.mu.Lock()
+				wasDegraded := s.recovered.Degraded()
+				s.recovered = rec
+				s.historyLoadError = ""
+				s.mu.Unlock()
+				if wasDegraded || rec.Degraded() {
+					s.inventory.invalidate()
+				}
+				// retry a failed pendingStamps computation: a stats-free
+				// bundle never advances again. Gate: served bundle must be history's latest.
 				s.mu.Lock()
 				s.pendingStamps = pendingReschemaStamps(ctx, hist, key, served)
 				s.mu.Unlock()
@@ -122,6 +154,8 @@ func (s *Server) adoptNewerSnapshot(ctx context.Context) {
 	s.mu.Lock()
 	s.annotated = a
 	s.pendingStamps = pending
+	s.recovered = rec
+	s.historyLoadError = ""
 	s.uninitialized = false
 	s.mu.Unlock()
 	s.freshness.servedAt = a.Schema.Timestamp
@@ -129,8 +163,13 @@ func (s *Server) adoptNewerSnapshot(ctx context.Context) {
 	// response can carry a schema_captured_at newer than the newest capture
 	// _meta.history reports, which reads as "what you are served is not stored"
 	s.inventory.invalidate()
-	slog.Info("picked up a newer snapshot from history",
-		"captured_at", a.Schema.Timestamp.UTC().Format(time.RFC3339), "content_hash", a.Schema.ContentHash)
+	if rec.Degraded() {
+		slog.Warn("serving an older valid bundle because newer history records are unreadable",
+			"served_hash", rec.ServedSchemaHash, "skipped_payloads", rec.SkippedPayloads())
+	} else {
+		slog.Info("picked up a newer snapshot from history",
+			"captured_at", a.Schema.Timestamp.UTC().Format(time.RFC3339), "content_hash", a.Schema.ContentHash)
+	}
 }
 
 // the prior-hash captures _meta shows beside stats_pending_reschema; a failed

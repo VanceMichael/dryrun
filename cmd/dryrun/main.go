@@ -858,7 +858,13 @@ func mcpServeCmd() *cobra.Command {
 				if server.BootstrapFromHistory(context.Background()) {
 					t, v, f := server.SchemaCounts()
 					fmt.Fprintf(os.Stderr, "dryrun: loaded schema from history.db (%d tables, %d views, %d functions, offline mode)\n", t, v, f)
+					if server.ServedDegraded() {
+						fmt.Fprintln(os.Stderr, "dryrun: warning: the newest history records are unreadable; serving the nearest older valid snapshot (see _meta.history)")
+					}
 				} else {
+					if note := server.HistoryLoadError(); note != "" {
+						fmt.Fprintf(os.Stderr, "dryrun: history present but unusable: %s\n", note)
+					}
 					fmt.Fprintf(os.Stderr, "dryrun: no schema snapshot in history.db for project=%s database=%s — starting in uninitialized mode\n",
 						key.ProjectID, key.DatabaseID)
 					fmt.Fprintln(os.Stderr, "dryrun: run 'dryrun init' or 'dryrun snapshot capture'; the snapshot is picked up on the next tool call")

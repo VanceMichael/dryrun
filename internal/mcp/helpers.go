@@ -64,6 +64,9 @@ type (
 		ActivityOldestNode string `json:"activity_oldest_node,omitempty"`
 		// served hash has no stats yet: the timestamps above are a prior hash's
 		StatsPendingReschema bool `json:"stats_pending_reschema,omitempty"`
+		// the served bundle skipped corrupt newest records and was assembled
+		// from older valid ones; detail lives per stream in History
+		ServedDegraded bool `json:"served_degraded,omitempty"`
 		// semantics live in historyFieldDoc, which is what the wire carries -- do not restate them here
 		History []historySpan `json:"history,omitempty"`
 		// the store is there and could not be read -- absence already means
@@ -95,6 +98,24 @@ type (
 		Nodes *int `json:"nodes,omitempty"`
 		// rows excluded from the span because their timestamp will not parse
 		CorruptRows int `json:"corrupt_rows,omitempty"`
+		// rows anywhere in the stream whose payload will not decode or whose
+		// embedded identity disagrees with their columns
+		PayloadCorruptRows int `json:"payload_corrupt_rows,omitempty"`
+		// tolerant latest skipped this stream's corrupt newest record(s) and
+		// served an older valid one instead
+		FellBack bool `json:"fell_back,omitempty"`
+		// the range the served schema requires holds rows but none usable;
+		// the stream is unavailable rather than merely uncaptured
+		UnavailableReason string `json:"unavailable_reason,omitempty"`
+		// per-node fallback detail on node-scoped streams
+		NodeFallbacks []historyNodeFallback `json:"node_fallbacks,omitempty"`
+	}
+
+	historyNodeFallback struct {
+		Node    string `json:"node"`
+		Skipped int    `json:"skipped_payloads,omitempty"`
+		// every payload for this node in the required range was unusable
+		Reason string `json:"unavailable_reason,omitempty"`
 	}
 )
 
@@ -112,6 +133,7 @@ func (s *Server) newMeta(hint string, next []NextCall) *toolMeta {
 		ActivityCapturedAt:   c.activity,
 		ActivityOldestNode:   c.activityNode,
 		StatsPendingReschema: c.pendingReschema,
+		ServedDegraded:       s.ServedDegraded(),
 		Hint:                 hint,
 		Next:                 next,
 	}
@@ -132,6 +154,9 @@ func (s *Server) injectMeta(val map[string]any, hint string, next []NextCall) {
 		meta["history"] = spans
 	} else if !ok {
 		meta["history_unavailable"] = true
+	}
+	if s.ServedDegraded() {
+		meta["served_degraded"] = true
 	}
 	if hint != "" {
 		meta["hint"] = hint

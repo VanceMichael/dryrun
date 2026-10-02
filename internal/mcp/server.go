@@ -34,6 +34,12 @@ type (
 		uninitialized   bool
 		freshness       freshness
 		inventory       historyInventory
+		// corruption-tolerant latest assembly audit trail for the served
+		// bundle: zero value means the newest records were served cleanly
+		recovered history.LatestRecovery
+		// why history could not supply any servable schema (corruption), so an
+		// uninitialized server says that instead of "never captured"
+		historyLoadError string
 	}
 )
 
@@ -86,17 +92,38 @@ func (s *Server) SetHistory(hist *history.Store) {
 	s.history = hist
 }
 
+// BootstrapFromHistory serves history's newest VALID bundle directly. A torn
+// newest record does not fail the boot: latest resolution falls back to the
+// nearest decodable generation and the server starts degraded. Only when no
+// decodable schema exists at all does this return false.
 func (s *Server) BootstrapFromHistory(ctx context.Context) bool {
-	a, pending, ok := s.loadAnnotatedFromHistory(ctx)
+	a, pending, rec, ok := s.loadAnnotatedFromHistory(ctx)
 	if !ok || a == nil || a.Schema == nil {
 		return false
 	}
 	s.mu.Lock()
 	s.annotated = a
 	s.pendingStamps = pending
+	s.recovered = rec
 	s.uninitialized = false
 	s.mu.Unlock()
 	return true
+}
+
+// HistoryLoadError reports the content-free reason history could not provide
+// a servable schema (all newest rows corrupt), or "" when it could.
+func (s *Server) HistoryLoadError() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.historyLoadError
+}
+
+// ServedDegraded reports whether the served bundle required skipping corrupt
+// newest records (schema fallback, per-node fallback, or an unusable range).
+func (s *Server) ServedDegraded() bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.recovered.Degraded()
 }
 
 // SchemaCounts reports the loaded snapshot's size; zeros when uninitialized.
@@ -108,20 +135,32 @@ func (s *Server) SchemaCounts() (tables, views, functions int) {
 	return len(snap.Tables), len(snap.Views), len(snap.Functions)
 }
 
-func (s *Server) loadAnnotatedFromHistory(ctx context.Context) (*schema.AnnotatedSchema, captureStamps, bool) {
+func (s *Server) loadAnnotatedFromHistory(ctx context.Context) (*schema.AnnotatedSchema, captureStamps, history.LatestRecovery, bool) {
 	s.mu.RLock()
 	hist := s.history
 	key := s.snapshotKey
 	s.mu.RUnlock()
 	if hist == nil || key.ProjectID == "" {
-		return nil, captureStamps{}, false
+		return nil, captureStamps{}, history.LatestRecovery{}, false
 	}
-	a, err := hist.GetAnnotated(ctx, key, history.NewRefLatest())
+	a, rec, err := hist.GetAnnotatedLatest(ctx, key)
 	if err != nil {
-		slog.Debug("history.GetAnnotated miss", "error", err)
-		return nil, captureStamps{}, false
+		slog.Debug("history.GetAnnotatedLatest miss", "error", err)
+		s.mu.Lock()
+		// a store with no valid predecessor says why; an empty history stays
+		// silent and reads as "not captured yet"
+		if errors.Is(err, history.ErrHistoryCorrupt) {
+			s.historyLoadError = err.Error()
+		} else {
+			s.historyLoadError = ""
+		}
+		s.mu.Unlock()
+		return nil, captureStamps{}, rec, false
 	}
-	return a, pendingReschemaStamps(ctx, hist, key, a), true
+	s.mu.Lock()
+	s.historyLoadError = ""
+	s.mu.Unlock()
+	return a, pendingReschemaStamps(ctx, hist, key, a), rec, true
 }
 
 func (s *Server) hasHistory() bool {
@@ -162,6 +201,10 @@ func (s *Server) noSchemaMsg() string {
 	if s.snapshotKey.ProjectID != "" {
 		// an empty history and a project/database mismatch fail identically
 		msg += fmt.Sprintf(" (looked under project=%s database=%s)", s.snapshotKey.ProjectID, s.snapshotKey.DatabaseID)
+	}
+	// every newest record corrupt is not the same as never captured: name it
+	if s.historyLoadError != "" {
+		msg += ". history is present but unusable: " + s.historyLoadError
 	}
 	return msg
 }
@@ -212,6 +255,8 @@ type (
 		activityNode string
 		// planner/activity above are a prior hash's captures, not the served bundle's
 		pendingReschema bool
+		// served bundle was assembled around corrupt newest records; counts only
+		degradedNote string
 	}
 )
 
@@ -241,6 +286,7 @@ func (s *Server) captureTimes() captureStamps {
 	// dropping the fields, which would read as "never captured"
 	s.mu.RLock()
 	pending := s.pendingStamps
+	recovered := s.recovered
 	s.mu.RUnlock()
 	if c.planner == "" && pending.planner != "" {
 		c.planner = pending.planner
@@ -250,6 +296,12 @@ func (s *Server) captureTimes() captureStamps {
 		c.activity = pending.activity
 		c.activityNode = pending.activityNode
 		c.pendingReschema = true
+	}
+	if n := recovered.SkippedPayloads(); n > 0 {
+		c.degradedNote = fmt.Sprintf(
+			"serving an older valid snapshot: %d corrupt payload row(s) skipped; see _meta.history", n)
+	} else if recovered.Degraded() {
+		c.degradedNote = "serving with unavailable history stream(s); see _meta.history"
 	}
 	return c
 }
@@ -318,6 +370,9 @@ func (c captureStamps) suffix() string {
 		// the header must not pass prior-hash timestamps as the served bundle's
 		parts = append(parts, "stats pending reschema")
 	}
+	if c.degradedNote != "" {
+		parts = append(parts, c.degradedNote)
+	}
 	if len(parts) == 0 {
 		return ""
 	}
@@ -338,6 +393,10 @@ func (s *Server) Instructions() string {
 	// surface a history.db compat problem here so MCP-only users see it
 	if note := s.historyNote(); note != nil {
 		metaNote += "\n\nWarning: " + *note + "."
+	}
+	// a cold start against a torn newest record serves an older valid bundle
+	if d := s.captureTimes().degradedNote; d != "" {
+		metaNote += "\n\nWarning: " + d + "."
 	}
 
 	dv := buildinfo.Get()
